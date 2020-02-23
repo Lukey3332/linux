@@ -42,8 +42,8 @@
  * Warning - DEBUG_PRINT prints security-sensitive data to the log,
  * so it should not be enabled in the official kernel
  */
-//#define DEBUG_PRINT
-//#define INTERNAL_VERIFY
+#define DEBUG_PRINT
+#define INTERNAL_VERIFY
 
 /*
  * On disk structures
@@ -54,6 +54,7 @@
 #define SB_VERSION_2			2
 #define SB_VERSION_3			3
 #define SB_VERSION_4			4
+#define SB_VERSION_5			5
 #define SB_SECTORS			8
 #define MAX_SECTORS_PER_BLOCK		8
 
@@ -75,6 +76,7 @@ struct superblock {
 #define SB_FLAG_RECALCULATING		0x2
 #define SB_FLAG_DIRTY_BITMAP		0x4
 #define SB_FLAG_FIXED_PADDING		0x8
+#define SB_FLAG_COPY_MODE			0x16
 
 #define	JOURNAL_ENTRY_ROUNDUP		8
 
@@ -253,6 +255,7 @@ struct dm_integrity_c {
 	bool just_formatted;
 	bool recalculate_flag;
 	bool fix_padding;
+	bool copy_mode;
 
 	struct alg_spec internal_hash_alg;
 	struct alg_spec journal_crypt_alg;
@@ -286,6 +289,7 @@ struct dm_integrity_io {
 	struct dm_integrity_range range;
 
 	sector_t metadata_block;
+	sector_t metadata_copy_block;
 	unsigned metadata_offset;
 
 	atomic_t in_flight;
@@ -414,7 +418,7 @@ do {									\
 } while (0)
 
 static __u64 get_metadata_sector_and_offset(struct dm_integrity_c *ic, sector_t area,
-					    sector_t offset, unsigned *metadata_offset)
+					    sector_t offset, unsigned *metadata_offset, __u64 *metadata_copy_sector)
 {
 	__u64 ms;
 	unsigned mo;
@@ -436,6 +440,13 @@ static __u64 get_metadata_sector_and_offset(struct dm_integrity_c *ic, sector_t 
 		mo = (offset * ic->tag_size) & ((1U << SECTOR_SHIFT << ic->log2_buffer_sectors) - 1);
 	}
 	*metadata_offset = mo;
+
+	if (ic->sb->flags & cpu_to_le32(SB_FLAG_COPY_MODE)) {
+		ms += ic->metadata_run >> 1;
+		if (metadata_copy_sector)
+			*metadata_copy_sector = ms + (ic->metadata_run >> 1) + (1U << ic->sb->log2_interleave_sectors >> SECTOR_SHIFT);
+	}
+
 	return ms;
 }
 
@@ -466,7 +477,9 @@ static void wraparound_section(struct dm_integrity_c *ic, unsigned *sec_ptr)
 
 static void sb_set_version(struct dm_integrity_c *ic)
 {
-	if (ic->sb->flags & cpu_to_le32(SB_FLAG_FIXED_PADDING))
+	if (ic->sb->flags & cpu_to_le32(SB_FLAG_COPY_MODE))
+		ic->sb->version = SB_VERSION_5;
+	else if (ic->sb->flags & cpu_to_le32(SB_FLAG_FIXED_PADDING))
 		ic->sb->version = SB_VERSION_4;
 	else if (ic->mode == 'B' || ic->sb->flags & cpu_to_le32(SB_FLAG_DIRTY_BITMAP))
 		ic->sb->version = SB_VERSION_3;
@@ -1523,6 +1536,8 @@ static void integrity_metadata(struct work_struct *w)
 	struct dm_integrity_c *ic = dio->ic;
 	unsigned sectors_to_process = dio->range.n_sectors;
 	sector_t sector = dio->range.logical_sector;
+	sector_t metadata_block = dio->metadata_block;
+	unsigned metadata_offset = dio->metadata_offset;
 
 	int r;
 
@@ -1561,7 +1576,7 @@ static void integrity_metadata(struct work_struct *w)
 				if (likely(checksums != checksums_onstack)) {
 					checksums_ptr += ic->tag_size;
 				} else {
-					r = dm_integrity_rw_tag(ic, checksums, &dio->metadata_block, &dio->metadata_offset,
+					r = dm_integrity_rw_tag(ic, checksums, &metadata_block, &metadata_offset,
 								ic->tag_size, !dio->write ? TAG_CMP : TAG_WRITE);
 					if (unlikely(r))
 						goto internal_hash_error;
@@ -1578,7 +1593,7 @@ static void integrity_metadata(struct work_struct *w)
 		}
 
 		if (likely(checksums != checksums_onstack)) {
-			r = dm_integrity_rw_tag(ic, checksums, &dio->metadata_block, &dio->metadata_offset,
+			r = dm_integrity_rw_tag(ic, checksums, &metadata_block, &metadata_offset,
 						(dio->range.n_sectors >> ic->sb->log2_sectors_per_block) * ic->tag_size,
 						!dio->write ? TAG_CMP : TAG_WRITE);
 			if (unlikely(r)) {
@@ -1629,6 +1644,8 @@ error:
 	dio->bi_status = errno_to_blk_status(r);
 	dec_in_flight(dio);
 }
+
+static void copy_mode_map_continue(struct dm_integrity_io *dio, bool from_map);
 
 static int dm_integrity_map(struct dm_target *ti, struct bio *bio)
 {
@@ -1706,10 +1723,13 @@ static int dm_integrity_map(struct dm_target *ti, struct bio *bio)
 		return DM_MAPIO_KILL;
 
 	get_area_and_offset(ic, dio->range.logical_sector, &area, &offset);
-	dio->metadata_block = get_metadata_sector_and_offset(ic, area, offset, &dio->metadata_offset);
+	dio->metadata_block = get_metadata_sector_and_offset(ic, area, offset, &dio->metadata_offset, &dio->metadata_copy_block);
 	bio->bi_iter.bi_sector = get_data_sector(ic, area, offset);
 
-	dm_integrity_map_continue(dio, true);
+	if (ic->sb->flags & cpu_to_le32(SB_FLAG_COPY_MODE) && dio->write)
+		copy_mode_map_continue(dio, true);
+	else
+		dm_integrity_map_continue(dio, true);
 	return DM_MAPIO_SUBMITTED;
 }
 
@@ -1857,7 +1877,7 @@ retry_kmap:
 
 		dio->range.logical_sector = logical_sector;
 		get_area_and_offset(ic, dio->range.logical_sector, &area, &offset);
-		dio->metadata_block = get_metadata_sector_and_offset(ic, area, offset, &dio->metadata_offset);
+		dio->metadata_block = get_metadata_sector_and_offset(ic, area, offset, &dio->metadata_offset, NULL);
 		return true;
 	}
 
@@ -2062,12 +2082,72 @@ journal_read_write:
 	do_endio_flush(ic, dio);
 }
 
+static void copy_mode_map_continue(struct dm_integrity_io *dio, bool from_map)
+{
+	struct dm_integrity_c *ic = dio->ic;
+	struct bio *bio = dm_bio_from_per_bio_data(dio, sizeof(struct dm_integrity_io));
+	struct completion write_comp;
+	
+	if (from_map) {
+		INIT_WORK(&dio->work, integrity_bio_wait);
+		queue_work(ic->wait_wq, &dio->work);
+		return;
+	}
+	
+	spin_lock_irq(&ic->endio_wait.lock);
+	if (unlikely(dm_integrity_failed(ic))) {
+		spin_unlock_irq(&ic->endio_wait.lock);
+		do_endio(ic, bio);
+		return;
+	}
+
+	dio->range.n_sectors = bio_sectors(bio);
+	if (unlikely(!add_new_range(ic, &dio->range, true)))
+		wait_and_add_new_range(ic, &dio->range);
+
+	spin_unlock_irq(&ic->endio_wait.lock);
+
+	dio->in_flight = (atomic_t)ATOMIC_INIT(5); // HACK
+
+	bio->bi_iter.bi_size = dio->range.n_sectors << SECTOR_SHIFT;
+	integrity_metadata(&dio->work);
+	dm_integrity_flush_buffers(ic);
+
+	init_completion(&write_comp);
+	dio->completion = &write_comp;
+
+	dio->orig_bi_iter = bio->bi_iter;
+
+	dio->orig_bi_disk = bio->bi_disk;
+	dio->orig_bi_partno = bio->bi_partno;
+	bio_set_dev(bio, ic->dev->bdev);
+
+	dio->orig_bi_integrity = bio_integrity(bio);
+	bio->bi_integrity = NULL;
+	bio->bi_opf &= ~REQ_INTEGRITY;
+
+	dio->orig_bi_end_io = bio->bi_end_io;
+	bio->bi_end_io = integrity_end_io;
+
+	generic_make_request(bio);
+
+	wait_for_completion_io(&write_comp);
+
+	dio->metadata_block = dio->metadata_copy_block;
+	integrity_metadata(&dio->work);
+	dm_integrity_flush_buffers(ic);
+
+	do_endio(ic, bio);
+}
 
 static void integrity_bio_wait(struct work_struct *w)
 {
 	struct dm_integrity_io *dio = container_of(w, struct dm_integrity_io, work);
 
-	dm_integrity_map_continue(dio, false);
+	if (dio->ic->sb->flags & cpu_to_le32(SB_FLAG_COPY_MODE) && dio->write)
+		copy_mode_map_continue(dio, false);
+	else
+		dm_integrity_map_continue(dio, false);
 }
 
 static void pad_uncommitted(struct dm_integrity_c *ic)
@@ -2271,7 +2351,7 @@ static void do_journal_write(struct dm_integrity_c *ic, unsigned write_start,
 			}
 			spin_unlock_irq(&ic->endio_wait.lock);
 
-			metadata_block = get_metadata_sector_and_offset(ic, area, offset, &metadata_offset);
+			metadata_block = get_metadata_sector_and_offset(ic, area, offset, &metadata_offset, NULL);
 			for (l = j; l < k; l++) {
 				int r;
 				struct journal_entry *je2 = access_journal_entry(ic, i, l);
@@ -2461,7 +2541,7 @@ next_chunk:
 		t += ic->tag_size;
 	}
 
-	metadata_block = get_metadata_sector_and_offset(ic, area, offset, &metadata_offset);
+	metadata_block = get_metadata_sector_and_offset(ic, area, offset, &metadata_offset, NULL);
 
 	r = dm_integrity_rw_tag(ic, ic->recalc_tags, &metadata_block, &metadata_offset, t - ic->recalc_tags, TAG_WRITE);
 	if (unlikely(r)) {
@@ -3070,6 +3150,11 @@ static int calculate_device_limits(struct dm_integrity_c *ic)
 
 		ic->metadata_run = round_up((__u64)ic->tag_size << (ic->sb->log2_interleave_sectors - ic->sb->log2_sectors_per_block),
 					    metadata_run_padding) >> SECTOR_SHIFT;
+
+		/* We need to double the sectors for the tag area in Copy mode */
+		if (ic->sb->flags & cpu_to_le32(SB_FLAG_COPY_MODE))
+			ic->metadata_run *= 2;
+
 		if (!(ic->metadata_run & (ic->metadata_run - 1)))
 			ic->log2_metadata_run = __ffs(ic->metadata_run);
 		else
@@ -3079,6 +3164,13 @@ static int calculate_device_limits(struct dm_integrity_c *ic)
 		last_sector = get_data_sector(ic, last_area, last_offset);
 		if (last_sector < ic->start || last_sector >= ic->meta_device_sectors)
 			return -EINVAL;
+		if (ic->sb->flags & cpu_to_le32(SB_FLAG_COPY_MODE)) {
+			unsigned metadata_offset;
+			__u64 metadata_sector, metadata_copy_sector;
+			metadata_sector = get_metadata_sector_and_offset(ic, last_area, last_offset, &metadata_offset, &metadata_copy_sector);
+			if (metadata_copy_sector >= ic->meta_device_sectors)
+				return -EINVAL;
+		}
 	} else {
 		__u64 meta_size = (ic->provided_data_sectors >> ic->sb->log2_sectors_per_block) * ic->tag_size;
 		meta_size = (meta_size + ((1U << (ic->log2_buffer_sectors + SECTOR_SHIFT)) - 1))
@@ -3114,6 +3206,8 @@ static int initialize_superblock(struct dm_integrity_c *ic, unsigned journal_sec
 	if (!ic->meta_dev) {
 		if (ic->fix_padding)
 			ic->sb->flags |= cpu_to_le32(SB_FLAG_FIXED_PADDING);
+		if (ic->copy_mode)
+			ic->sb->flags |= cpu_to_le32(SB_FLAG_COPY_MODE);
 		ic->sb->journal_sections = cpu_to_le32(journal_sections);
 		if (!interleave_sectors)
 			interleave_sectors = DEFAULT_INTERLEAVE_SECTORS;
@@ -3755,6 +3849,8 @@ static int dm_integrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 			ic->recalculate_flag = true;
 		} else if (!strcmp(opt_string, "fix_padding")) {
 			ic->fix_padding = true;
+		} else if (!strcmp(opt_string, "copy_mode")) {
+			ic->copy_mode = true;
 		} else {
 			r = -EINVAL;
 			ti->error = "Invalid argument";
@@ -3805,9 +3901,9 @@ static int dm_integrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	else
 		ic->log2_tag_size = -1;
 
-	if (ic->mode == 'B' && !ic->internal_hash) {
+	if ((ic->mode == 'B' || ic->copy_mode) && !ic->internal_hash) {
 		r = -EINVAL;
-		ti->error = "Bitmap mode can be only used with internal hash";
+		ti->error = "Bitmap and Copy mode can be only used with internal hash";
 		goto bad;
 	}
 
@@ -3897,7 +3993,7 @@ static int dm_integrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 			should_write_sb = true;
 	}
 
-	if (!ic->sb->version || ic->sb->version > SB_VERSION_4) {
+	if (!ic->sb->version || ic->sb->version > SB_VERSION_5) {
 		r = -EINVAL;
 		ti->error = "Unknown version";
 		goto bad;
