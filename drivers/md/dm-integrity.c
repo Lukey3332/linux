@@ -302,6 +302,8 @@ struct dm_integrity_io {
 	bio_end_io_t *orig_bi_end_io;
 	struct bio_integrity_payload *orig_bi_integrity;
 	struct bvec_iter orig_bi_iter;
+
+	void * copy;
 };
 
 struct journal_completion {
@@ -442,9 +444,9 @@ static __u64 get_metadata_sector_and_offset(struct dm_integrity_c *ic, sector_t 
 	*metadata_offset = mo;
 
 	if (ic->sb->flags & cpu_to_le32(SB_FLAG_COPY_MODE)) {
-		ms += ic->metadata_run >> 1;
+		ms += (ic->metadata_run >> 1) >> SECTOR_SHIFT;
 		if (metadata_copy_sector)
-			*metadata_copy_sector = ms + (ic->metadata_run >> 1) + (1U << ic->sb->log2_interleave_sectors >> SECTOR_SHIFT);
+			*metadata_copy_sector = ms + ((ic->metadata_run >> 1) >> SECTOR_SHIFT) + ((1U << ic->sb->log2_interleave_sectors) >> SECTOR_SHIFT);
 	}
 
 	return ms;
@@ -1310,7 +1312,7 @@ static bool find_newer_committed_node(struct dm_integrity_c *ic, struct journal_
 #define TAG_CMP		2
 
 static int dm_integrity_rw_tag(struct dm_integrity_c *ic, unsigned char *tag, sector_t *metadata_block,
-			       unsigned *metadata_offset, unsigned total_size, int op)
+			       unsigned *metadata_offset, unsigned total_size, int op, void * copy)
 {
 	do {
 		unsigned char *data, *dp;
@@ -1339,6 +1341,8 @@ static int dm_integrity_rw_tag(struct dm_integrity_c *ic, unsigned char *tag, se
 			memcpy(tag, dp, to_copy);
 		} else if (op == TAG_WRITE) {
 			memcpy(dp, tag, to_copy);
+			if (copy)
+				memcpy(copy, data, 1U << SECTOR_SHIFT);
 			dm_bufio_mark_partial_buffer_dirty(b, *metadata_offset, *metadata_offset + to_copy);
 		} else  {
 			/* e.g.: op == TAG_CMP */
@@ -1577,7 +1581,7 @@ static void integrity_metadata(struct work_struct *w)
 					checksums_ptr += ic->tag_size;
 				} else {
 					r = dm_integrity_rw_tag(ic, checksums, &metadata_block, &metadata_offset,
-								ic->tag_size, !dio->write ? TAG_CMP : TAG_WRITE);
+								ic->tag_size, !dio->write ? TAG_CMP : TAG_WRITE, dio->copy);
 					if (unlikely(r))
 						goto internal_hash_error;
 				}
@@ -1595,7 +1599,7 @@ static void integrity_metadata(struct work_struct *w)
 		if (likely(checksums != checksums_onstack)) {
 			r = dm_integrity_rw_tag(ic, checksums, &metadata_block, &metadata_offset,
 						(dio->range.n_sectors >> ic->sb->log2_sectors_per_block) * ic->tag_size,
-						!dio->write ? TAG_CMP : TAG_WRITE);
+						!dio->write ? TAG_CMP : TAG_WRITE, dio->copy);
 			if (unlikely(r)) {
 				kfree(checksums);
 				goto internal_hash_error;
@@ -1621,7 +1625,7 @@ static void integrity_metadata(struct work_struct *w)
 				tag = lowmem_page_address(biv.bv_page) + biv.bv_offset;
 				this_len = min(biv.bv_len, data_to_process);
 				r = dm_integrity_rw_tag(ic, tag, &dio->metadata_block, &dio->metadata_offset,
-							this_len, !dio->write ? TAG_READ : TAG_WRITE);
+							this_len, !dio->write ? TAG_READ : TAG_WRITE, dio->copy);
 				if (unlikely(r))
 					goto error;
 				data_to_process -= this_len;
@@ -1657,6 +1661,7 @@ static int dm_integrity_map(struct dm_target *ti, struct bio *bio)
 
 	dio->ic = ic;
 	dio->bi_status = 0;
+	dio->copy = NULL;
 
 	if (unlikely(bio->bi_opf & REQ_PREFLUSH)) {
 		submit_flush_bio(ic, dio);
@@ -2082,41 +2087,38 @@ journal_read_write:
 	do_endio_flush(ic, dio);
 }
 
+static void dummy_end_io(struct bio *bio)
+{
+	bio_free_pages(bio);
+	bio_put(bio);
+}
+
 static void copy_mode_map_continue(struct dm_integrity_io *dio, bool from_map)
 {
 	struct dm_integrity_c *ic = dio->ic;
 	struct bio *bio = dm_bio_from_per_bio_data(dio, sizeof(struct dm_integrity_io));
 	struct completion write_comp;
-	
+	struct bio *copy_bio;
+	struct page *copy_page;
+
 	if (from_map) {
 		INIT_WORK(&dio->work, integrity_bio_wait);
 		queue_work(ic->wait_wq, &dio->work);
 		return;
 	}
-	
-	spin_lock_irq(&ic->endio_wait.lock);
-	if (unlikely(dm_integrity_failed(ic))) {
-		spin_unlock_irq(&ic->endio_wait.lock);
-		do_endio(ic, bio);
-		return;
-	}
 
-	dio->range.n_sectors = bio_sectors(bio);
-	if (unlikely(!add_new_range(ic, &dio->range, true)))
-		wait_and_add_new_range(ic, &dio->range);
-
-	spin_unlock_irq(&ic->endio_wait.lock);
+	copy_page = alloc_page(GFP_KERNEL);
+	dio->copy = page_address(copy_page);
 
 	dio->in_flight = (atomic_t)ATOMIC_INIT(5); // HACK
 
-	bio->bi_iter.bi_size = dio->range.n_sectors << SECTOR_SHIFT;
+	dio->orig_bi_iter = bio->bi_iter;
 	integrity_metadata(&dio->work);
-	dm_integrity_flush_buffers(ic);
+	dm_bufio_submit_dirty_buffers(ic->bufio);
+	bio->bi_iter = dio->orig_bi_iter;
 
 	init_completion(&write_comp);
 	dio->completion = &write_comp;
-
-	dio->orig_bi_iter = bio->bi_iter;
 
 	dio->orig_bi_disk = bio->bi_disk;
 	dio->orig_bi_partno = bio->bi_partno;
@@ -2126,16 +2128,23 @@ static void copy_mode_map_continue(struct dm_integrity_io *dio, bool from_map)
 	bio->bi_integrity = NULL;
 	bio->bi_opf &= ~REQ_INTEGRITY;
 
+	bio->bi_opf |= REQ_PREFLUSH;
+
 	dio->orig_bi_end_io = bio->bi_end_io;
 	bio->bi_end_io = integrity_end_io;
 
+	bio->bi_iter.bi_size = dio->range.n_sectors << SECTOR_SHIFT;
 	generic_make_request(bio);
 
 	wait_for_completion_io(&write_comp);
 
-	dio->metadata_block = dio->metadata_copy_block;
-	integrity_metadata(&dio->work);
-	dm_integrity_flush_buffers(ic);
+	copy_bio = bio_alloc(GFP_NOIO, 1);
+	copy_bio->bi_iter.bi_sector = dio->metadata_copy_block;
+	bio_set_dev(copy_bio, ic->dev->bdev);
+	bio_add_page(copy_bio, copy_page, 512, 0);
+	copy_bio->bi_end_io = dummy_end_io;
+	copy_bio->bi_opf |= REQ_FUA | REQ_PREFLUSH;
+	generic_make_request(copy_bio);
 
 	do_endio(ic, bio);
 }
@@ -2371,7 +2380,7 @@ static void do_journal_write(struct dm_integrity_c *ic, unsigned write_start,
 
 				journal_entry_set_unused(je2);
 				r = dm_integrity_rw_tag(ic, journal_entry_tag(ic, je2), &metadata_block, &metadata_offset,
-							ic->tag_size, TAG_WRITE);
+							ic->tag_size, TAG_WRITE, NULL);
 				if (unlikely(r)) {
 					dm_integrity_io_error(ic, "reading tags", r);
 				}
@@ -2543,7 +2552,7 @@ next_chunk:
 
 	metadata_block = get_metadata_sector_and_offset(ic, area, offset, &metadata_offset, NULL);
 
-	r = dm_integrity_rw_tag(ic, ic->recalc_tags, &metadata_block, &metadata_offset, t - ic->recalc_tags, TAG_WRITE);
+	r = dm_integrity_rw_tag(ic, ic->recalc_tags, &metadata_block, &metadata_offset, t - ic->recalc_tags, TAG_WRITE, NULL);
 	if (unlikely(r)) {
 		dm_integrity_io_error(ic, "writing tags", r);
 		goto err;
@@ -2994,17 +3003,17 @@ static void dm_integrity_resume(struct dm_target *ti)
 		}
 	}
 
-	DEBUG_print("testing recalc: %x\n", ic->sb->flags);
-	if (ic->sb->flags & cpu_to_le32(SB_FLAG_RECALCULATING)) {
-		__u64 recalc_pos = le64_to_cpu(ic->sb->recalc_sector);
-		DEBUG_print("recalc pos: %lx / %lx\n", (long)recalc_pos, ic->provided_data_sectors);
-		if (recalc_pos < ic->provided_data_sectors) {
-			queue_work(ic->recalc_wq, &ic->recalc_work);
-		} else if (recalc_pos > ic->provided_data_sectors) {
-			ic->sb->recalc_sector = cpu_to_le64(ic->provided_data_sectors);
-			recalc_write_super(ic);
-		}
-	}
+	//DEBUG_print("testing recalc: %x\n", ic->sb->flags);
+	//if (ic->sb->flags & cpu_to_le32(SB_FLAG_RECALCULATING)) {
+		//__u64 recalc_pos = le64_to_cpu(ic->sb->recalc_sector);
+		//DEBUG_print("recalc pos: %lx / %lx\n", (long)recalc_pos, ic->provided_data_sectors);
+		//if (recalc_pos < ic->provided_data_sectors) {
+			//queue_work(ic->recalc_wq, &ic->recalc_work);
+		//} else if (recalc_pos > ic->provided_data_sectors) {
+			//ic->sb->recalc_sector = cpu_to_le64(ic->provided_data_sectors);
+			//recalc_write_super(ic);
+		//}
+	//}
 
 	ic->reboot_notifier.notifier_call = dm_integrity_reboot;
 	ic->reboot_notifier.next = NULL;

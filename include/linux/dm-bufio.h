@@ -112,6 +112,7 @@ void dm_bufio_write_dirty_buffers_async(struct dm_bufio_client *c);
  * to this call are on disk when this call exits.
  */
 int dm_bufio_write_dirty_buffers(struct dm_bufio_client *c);
+int dm_bufio_submit_dirty_buffers(struct dm_bufio_client *c);
 
 /*
  * Send an empty write barrier to the device to flush hardware disk cache.

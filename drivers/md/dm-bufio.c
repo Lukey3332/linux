@@ -1229,9 +1229,8 @@ EXPORT_SYMBOL_GPL(dm_bufio_write_dirty_buffers_async);
  *
  * Finally, we flush hardware disk cache.
  */
-int dm_bufio_write_dirty_buffers(struct dm_bufio_client *c)
+int dm_bufio_submit_dirty_buffers(struct dm_bufio_client *c)
 {
-	int a, f;
 	unsigned long buffers_processed = 0;
 	struct dm_buffer *b, *tmp;
 
@@ -1292,7 +1291,14 @@ again:
 	wake_up(&c->free_buffer_wait);
 	dm_bufio_unlock(c);
 
-	a = xchg(&c->async_write_error, 0);
+	return xchg(&c->async_write_error, 0);
+}
+EXPORT_SYMBOL_GPL(dm_bufio_submit_dirty_buffers);
+
+int dm_bufio_write_dirty_buffers(struct dm_bufio_client *c)
+{
+	int a, f;
+	a = dm_bufio_submit_dirty_buffers(c);
 	f = dm_bufio_issue_flush(c);
 	if (a)
 		return a;
