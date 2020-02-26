@@ -2128,7 +2128,7 @@ static void copy_mode_map_continue(struct dm_integrity_io *dio, bool from_map)
 	bio->bi_integrity = NULL;
 	bio->bi_opf &= ~REQ_INTEGRITY;
 
-	bio->bi_opf |= REQ_PREFLUSH;
+	bio->bi_opf |= REQ_PREFLUSH | REQ_SYNC;
 
 	dio->orig_bi_end_io = bio->bi_end_io;
 	bio->bi_end_io = integrity_end_io;
