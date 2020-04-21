@@ -388,7 +388,7 @@ struct dm_block_manager *dm_block_manager_create(struct block_device *bdev,
 		goto bad;
 	}
 
-	bm->bufio = dm_bufio_client_create(bdev, block_size, max_held_per_thread,
+	bm->bufio = dm_bufio_client_create(bdev, block_size, 0, max_held_per_thread,
 					   sizeof(struct buffer_aux),
 					   dm_block_manager_alloc_callback,
 					   dm_block_manager_write_callback);
