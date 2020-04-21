@@ -3622,7 +3622,7 @@ static int dm_integrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	static const struct dm_arg _args[] = {
 		{0, 9, "Invalid number of feature args"},
 	};
-	unsigned journal_sectors, interleave_sectors, buffer_sectors, journal_watermark, sync_msec;
+	unsigned journal_sectors, interleave_sectors, buffer_sectors, write_align, journal_watermark, sync_msec;
 	bool should_write_sb;
 	__u64 threshold;
 	unsigned long long start;
@@ -3689,6 +3689,7 @@ static int dm_integrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	journal_sectors = 0;
 	interleave_sectors = DEFAULT_INTERLEAVE_SECTORS;
 	buffer_sectors = DEFAULT_BUFFER_SECTORS;
+	write_align = 0;
 	journal_watermark = DEFAULT_JOURNAL_WATERMARK;
 	sync_msec = DEFAULT_SYNC_MSEC;
 	ic->sectors_per_block = 1;
@@ -3715,7 +3716,13 @@ static int dm_integrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 			interleave_sectors = val;
 		else if (sscanf(opt_string, "buffer_sectors:%u%c", &val, &dummy) == 1)
 			buffer_sectors = val;
-		else if (sscanf(opt_string, "journal_watermark:%u%c", &val, &dummy) == 1 && val <= 100)
+		else if (sscanf(opt_string, "write_align:%u%c", &val, &dummy) == 1) {
+			if (val < 1 << SECTOR_SHIFT || val & (val - 1)) {
+				ti->error = "Invalid write_align argument";
+				goto bad;
+			}
+			write_align = val;
+		} else if (sscanf(opt_string, "journal_watermark:%u%c", &val, &dummy) == 1 && val <= 100)
 			journal_watermark = val;
 		else if (sscanf(opt_string, "commit_time:%u%c", &val, &dummy) == 1)
 			sync_msec = val;
@@ -4059,7 +4066,8 @@ try_smaller_buffer:
 	}
 
 	ic->bufio = dm_bufio_client_create(ic->meta_dev ? ic->meta_dev->bdev : ic->dev->bdev,
-			1U << (SECTOR_SHIFT + ic->log2_buffer_sectors), 1, 0, 0, NULL, NULL);
+			1U << (SECTOR_SHIFT + ic->log2_buffer_sectors),
+			1, 0, write_align, NULL, NULL);
 	if (IS_ERR(ic->bufio)) {
 		r = PTR_ERR(ic->bufio);
 		ti->error = "Cannot initialize dm-bufio";
