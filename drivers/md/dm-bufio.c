@@ -55,7 +55,7 @@
  * Align buffer writes to this boundary.
  * Tests show that SSDs have the highest IOPS when using 4k writes.
  */
-#define DM_BUFIO_WRITE_ALIGN		4096
+#define DM_BUFIO_DEFAULT_WRITE_ALIGN    4096
 
 /*
  * dm_buffer->list_mode
@@ -87,6 +87,7 @@ struct dm_bufio_client {
 
 	struct block_device *bdev;
 	unsigned block_size;
+	int write_align;
 	s8 sectors_per_block_bits;
 	void (*alloc_callback)(struct dm_buffer *);
 	void (*write_callback)(struct dm_buffer *);
@@ -677,9 +678,9 @@ static inline sector_t block_to_sector(struct dm_bufio_client *c, sector_t block
 
 static void align_write(struct dm_bufio_client *c, unsigned *offset, unsigned *end)
 {
-	*offset &= -DM_BUFIO_WRITE_ALIGN;
-	*end += DM_BUFIO_WRITE_ALIGN - 1;
-	*end &= -DM_BUFIO_WRITE_ALIGN;
+	*offset &= -c->write_align;
+	*end += c->write_align - 1;
+	*end &= -c->write_align;
 	if (unlikely(*end > c->block_size))
 		*end = c->block_size;
 }
@@ -1694,6 +1695,18 @@ void dm_bufio_set_minimum_buffers(struct dm_bufio_client *c, unsigned n)
 }
 EXPORT_SYMBOL_GPL(dm_bufio_set_minimum_buffers);
 
+void dm_bufio_set_alignment(struct dm_bufio_client *c, unsigned n)
+{
+	c->write_align = n;
+}
+EXPORT_SYMBOL_GPL(dm_bufio_set_alignment);
+
+unsigned dm_bufio_get_alignment(struct dm_bufio_client *c)
+{
+	return c->write_align;
+}
+EXPORT_SYMBOL_GPL(dm_bufio_get_alignment);
+
 unsigned dm_bufio_get_block_size(struct dm_bufio_client *c)
 {
 	return c->block_size;
@@ -1911,6 +1924,7 @@ struct dm_bufio_client *dm_bufio_client_create(struct block_device *bdev, unsign
 		c->sectors_per_block_bits = __ffs(block_size) - SECTOR_SHIFT;
 	else
 		c->sectors_per_block_bits = -1;
+	c->write_align = DM_BUFIO_DEFAULT_WRITE_ALIGN;
 
 	c->alloc_callback = alloc_callback;
 	c->write_callback = write_callback;
