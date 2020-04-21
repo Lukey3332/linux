@@ -110,6 +110,10 @@ buffer_sectors:number
 	configurable. The large buffer size means that the I/O size will
 	be larger, but there could be less I/Os issued.
 
+metadata_align:
+	The write alignment for metadata in bytes. Must be a power of two and
+	at least 512 bytes.
+
 journal_watermark:number
 	The journal watermark in percents. When the size of the journal
 	exceeds this watermark, the thread that flushes the journal will
