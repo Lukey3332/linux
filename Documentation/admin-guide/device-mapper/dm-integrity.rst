@@ -110,6 +110,9 @@ buffer_sectors:number
 	configurable. The large buffer size means that the I/O size will
 	be larger, but there could be less I/Os issued.
 
+write_align:
+	The write alignment for dm-bufio in bytes. Must be at least 512 bytes.
+
 journal_watermark:number
 	The journal watermark in percents. When the size of the journal
 	exceeds this watermark, the thread that flushes the journal will
