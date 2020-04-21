@@ -113,6 +113,9 @@ buffer_sectors:number
 write_align:
 	The write alignment for dm-bufio in bytes. Must be at least 512 bytes.
 
+prefetch:
+	Prefetch n buffers when accessing metadata.
+
 journal_watermark:number
 	The journal watermark in percents. When the size of the journal
 	exceeds this watermark, the thread that flushes the journal will

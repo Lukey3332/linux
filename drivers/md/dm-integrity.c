@@ -29,6 +29,7 @@
 #define DEFAULT_JOURNAL_SIZE_FACTOR	7
 #define DEFAULT_SECTORS_PER_BITMAP_BIT	32768
 #define DEFAULT_BUFFER_SECTORS		128
+#define DEFAULT_PREFETCH		0
 #define DEFAULT_JOURNAL_WATERMARK	50
 #define DEFAULT_SYNC_MSEC		10000
 #define DEFAULT_MAX_JOURNAL_SECTORS	131072
@@ -198,6 +199,7 @@ struct dm_integrity_c {
 	sector_t meta_device_sectors;
 	unsigned initial_sectors;
 	unsigned metadata_run;
+	unsigned prefetch;
 	__s8 log2_metadata_run;
 	__u8 log2_buffer_sectors;
 	__u8 sectors_per_block;
@@ -291,6 +293,7 @@ struct dm_integrity_io {
 
 	struct dm_integrity_range range;
 
+	sector_t metadata_area;
 	sector_t metadata_block;
 	unsigned metadata_offset;
 
@@ -416,7 +419,8 @@ do {									\
 } while (0)
 
 static __u64 get_metadata_sector_and_offset(struct dm_integrity_c *ic, sector_t area,
-					    sector_t offset, unsigned *metadata_offset)
+					    sector_t offset, sector_t *metadata_area,
+					    unsigned *metadata_offset)
 {
 	__u64 ms;
 	unsigned mo;
@@ -427,6 +431,8 @@ static __u64 get_metadata_sector_and_offset(struct dm_integrity_c *ic, sector_t 
 	else
 		ms += area * ic->metadata_run;
 	ms >>= ic->log2_buffer_sectors;
+
+	*metadata_area = ms;
 
 	sector_to_block(ic, offset);
 
@@ -1294,17 +1300,27 @@ static bool find_newer_committed_node(struct dm_integrity_c *ic, struct journal_
 	return false;
 }
 
+static void prefetch_metadata(struct dm_integrity_c *ic, sector_t metadata_area,
+			      sector_t metadata_block)
+{
+	unsigned remaining_sectors = metadata_area + (ic->metadata_run >> ic->log2_buffer_sectors) - metadata_block;
+	if (ic->prefetch && remaining_sectors)
+		dm_bufio_prefetch(ic->bufio, metadata_block, min(ic->prefetch, remaining_sectors));
+}
+
 #define TAG_READ	0
 #define TAG_WRITE	1
 #define TAG_CMP		2
 
-static int dm_integrity_rw_tag(struct dm_integrity_c *ic, unsigned char *tag, sector_t *metadata_block,
+static int dm_integrity_rw_tag(struct dm_integrity_c *ic, unsigned char *tag,
+			       sector_t *metadata_area, sector_t *metadata_block,
 			       unsigned *metadata_offset, unsigned total_size, int op)
 {
 #define MAY_BE_FILLER		1
 #define MAY_BE_HASH		2
 	unsigned hash_offset = 0;
 	unsigned may_be = MAY_BE_HASH | (ic->discard ? MAY_BE_FILLER : 0);
+	bool do_prefetch = true;
 
 	do {
 		unsigned char *data, *dp;
@@ -1324,6 +1340,10 @@ static int dm_integrity_rw_tag(struct dm_integrity_c *ic, unsigned char *tag, se
 			if (IS_ERR(data))
 				return PTR_ERR(data);
 		} else {
+			if (do_prefetch) {
+				prefetch_metadata(ic, *metadata_area, *metadata_block);
+				do_prefetch = false;
+			}
 			data = dm_bufio_read(ic->bufio, *metadata_block, &b);
 			if (IS_ERR(data))
 				return PTR_ERR(data);
@@ -1587,7 +1607,8 @@ static void integrity_metadata(struct work_struct *w)
 			while (bi_size) {
 				unsigned this_step_blocks = bi_size >> (SECTOR_SHIFT + ic->sb->log2_sectors_per_block);
 				this_step_blocks = min(this_step_blocks, max_blocks);
-				r = dm_integrity_rw_tag(ic, checksums, &dio->metadata_block, &dio->metadata_offset,
+				r = dm_integrity_rw_tag(ic, checksums, &dio->metadata_area,
+							&dio->metadata_block, &dio->metadata_offset,
 							this_step_blocks * ic->tag_size, TAG_WRITE);
 				if (unlikely(r)) {
 					if (likely(checksums != checksums_onstack))
@@ -1621,7 +1642,8 @@ static void integrity_metadata(struct work_struct *w)
 				if (likely(checksums != checksums_onstack)) {
 					checksums_ptr += ic->tag_size;
 				} else {
-					r = dm_integrity_rw_tag(ic, checksums, &dio->metadata_block, &dio->metadata_offset,
+					r = dm_integrity_rw_tag(ic, checksums, &dio->metadata_area,
+								&dio->metadata_block, &dio->metadata_offset,
 								ic->tag_size, dio->op == REQ_OP_READ ? TAG_CMP : TAG_WRITE);
 					if (unlikely(r)) {
 						kunmap_atomic(mem);
@@ -1640,7 +1662,8 @@ static void integrity_metadata(struct work_struct *w)
 		}
 
 		if (likely(checksums != checksums_onstack)) {
-			r = dm_integrity_rw_tag(ic, checksums, &dio->metadata_block, &dio->metadata_offset,
+			r = dm_integrity_rw_tag(ic, checksums,
+						&dio->metadata_area, &dio->metadata_block, &dio->metadata_offset,
 						(dio->range.n_sectors >> ic->sb->log2_sectors_per_block) * ic->tag_size,
 						dio->op == REQ_OP_READ ? TAG_CMP : TAG_WRITE);
 			if (unlikely(r)) {
@@ -1667,8 +1690,10 @@ static void integrity_metadata(struct work_struct *w)
 				BUG_ON(PageHighMem(biv.bv_page));
 				tag = lowmem_page_address(biv.bv_page) + biv.bv_offset;
 				this_len = min(biv.bv_len, data_to_process);
-				r = dm_integrity_rw_tag(ic, tag, &dio->metadata_block, &dio->metadata_offset,
-							this_len, dio->op == REQ_OP_READ ? TAG_READ : TAG_WRITE);
+				r = dm_integrity_rw_tag(ic, tag, &dio->metadata_area, &dio->metadata_block,
+							&dio->metadata_offset, this_len,
+							dio->op == REQ_OP_READ ? TAG_READ : TAG_WRITE);
+
 				if (unlikely(r))
 					goto error;
 				data_to_process -= this_len;
@@ -1782,7 +1807,8 @@ static int dm_integrity_map(struct dm_target *ti, struct bio *bio)
 		return DM_MAPIO_KILL;
 
 	get_area_and_offset(ic, dio->range.logical_sector, &area, &offset);
-	dio->metadata_block = get_metadata_sector_and_offset(ic, area, offset, &dio->metadata_offset);
+	dio->metadata_block = get_metadata_sector_and_offset(ic, area, offset,
+					&dio->metadata_area, &dio->metadata_offset);
 	bio->bi_iter.bi_sector = get_data_sector(ic, area, offset);
 
 	dm_integrity_map_continue(dio, true);
@@ -1933,7 +1959,8 @@ retry_kmap:
 
 		dio->range.logical_sector = logical_sector;
 		get_area_and_offset(ic, dio->range.logical_sector, &area, &offset);
-		dio->metadata_block = get_metadata_sector_and_offset(ic, area, offset, &dio->metadata_offset);
+		dio->metadata_block = get_metadata_sector_and_offset(ic, area, offset,
+						&dio->metadata_area, &dio->metadata_offset);
 		return true;
 	}
 
@@ -2307,6 +2334,7 @@ static void do_journal_write(struct dm_integrity_c *ic, unsigned write_start,
 			struct journal_entry *je = access_journal_entry(ic, i, j);
 			sector_t sec, area, offset;
 			unsigned k, l, next_loop;
+			sector_t metadata_area;
 			sector_t metadata_block;
 			unsigned metadata_offset;
 			struct journal_io *io;
@@ -2381,7 +2409,8 @@ static void do_journal_write(struct dm_integrity_c *ic, unsigned write_start,
 			}
 			spin_unlock_irq(&ic->endio_wait.lock);
 
-			metadata_block = get_metadata_sector_and_offset(ic, area, offset, &metadata_offset);
+			metadata_block = get_metadata_sector_and_offset(ic, area, offset,
+											&metadata_area, &metadata_offset);
 			for (l = j; l < k; l++) {
 				int r;
 				struct journal_entry *je2 = access_journal_entry(ic, i, l);
@@ -2400,7 +2429,8 @@ static void do_journal_write(struct dm_integrity_c *ic, unsigned write_start,
 				}
 
 				journal_entry_set_unused(je2);
-				r = dm_integrity_rw_tag(ic, journal_entry_tag(ic, je2), &metadata_block, &metadata_offset,
+				r = dm_integrity_rw_tag(ic, journal_entry_tag(ic, je2),
+							&metadata_area, &metadata_block, &metadata_offset,
 							ic->tag_size, TAG_WRITE);
 				if (unlikely(r)) {
 					dm_integrity_io_error(ic, "reading tags", r);
@@ -2485,6 +2515,7 @@ static void integrity_recalc(struct work_struct *w)
 	struct dm_io_request io_req;
 	struct dm_io_region io_loc;
 	sector_t area, offset;
+	sector_t metadata_area;
 	sector_t metadata_block;
 	unsigned metadata_offset;
 	sector_t logical_sector, n_sectors;
@@ -2574,9 +2605,11 @@ next_chunk:
 		t += ic->tag_size;
 	}
 
-	metadata_block = get_metadata_sector_and_offset(ic, area, offset, &metadata_offset);
+	metadata_block = get_metadata_sector_and_offset(ic, area, offset,
+						&metadata_area, &metadata_offset);
 
-	r = dm_integrity_rw_tag(ic, ic->recalc_tags, &metadata_block, &metadata_offset, t - ic->recalc_tags, TAG_WRITE);
+	r = dm_integrity_rw_tag(ic, ic->recalc_tags, &metadata_area, &metadata_block,
+				&metadata_offset, t - ic->recalc_tags, TAG_WRITE);
 	if (unlikely(r)) {
 		dm_integrity_io_error(ic, "writing tags", r);
 		goto err;
@@ -3782,7 +3815,7 @@ static int dm_integrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	static const struct dm_arg _args[] = {
 		{0, 9, "Invalid number of feature args"},
 	};
-	unsigned journal_sectors, interleave_sectors, buffer_sectors, write_align, journal_watermark, sync_msec;
+	unsigned journal_sectors, interleave_sectors, buffer_sectors, write_align, prefetch, journal_watermark, sync_msec;
 	bool should_write_sb;
 	__u64 threshold;
 	unsigned long long start;
@@ -3850,6 +3883,7 @@ static int dm_integrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	interleave_sectors = DEFAULT_INTERLEAVE_SECTORS;
 	buffer_sectors = DEFAULT_BUFFER_SECTORS;
 	write_align = 0;
+	prefetch = DEFAULT_PREFETCH;
 	journal_watermark = DEFAULT_JOURNAL_WATERMARK;
 	sync_msec = DEFAULT_SYNC_MSEC;
 	ic->sectors_per_block = 1;
@@ -3882,7 +3916,9 @@ static int dm_integrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 				goto bad;
 			}
 			write_align = val;
-		} else if (sscanf(opt_string, "journal_watermark:%u%c", &val, &dummy) == 1 && val <= 100)
+		} else if (sscanf(opt_string, "prefetch:%u%c", &val, &dummy) == 1)
+			prefetch = val;
+		else if (sscanf(opt_string, "journal_watermark:%u%c", &val, &dummy) == 1 && val <= 100)
 			journal_watermark = val;
 		else if (sscanf(opt_string, "commit_time:%u%c", &val, &dummy) == 1)
 			sync_msec = val;
@@ -3956,6 +3992,8 @@ static int dm_integrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	if (!buffer_sectors)
 		buffer_sectors = 1;
 	ic->log2_buffer_sectors = min((int)__fls(buffer_sectors), 31 - SECTOR_SHIFT);
+
+	ic->prefetch = prefetch;
 
 	r = get_mac(&ic->internal_hash, &ic->internal_hash_alg, &ti->error,
 		    "Invalid internal hash", "Error setting internal hash key");
