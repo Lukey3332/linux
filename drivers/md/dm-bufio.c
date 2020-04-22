@@ -119,7 +119,9 @@ struct dm_bufio_client {
  */
 #define B_READING	0
 #define B_WRITING	1
-#define B_DIRTY		2
+#define B_CLEANING	2
+#define B_DIRTY		3
+#define B_PARTIAL	4
 
 /*
  * Describes how the block was allocated:
@@ -145,10 +147,13 @@ struct dm_buffer {
 	blk_status_t write_error;
 	unsigned accessed;
 	unsigned hold_count;
+	atomic_t external_count;
 	unsigned long state;
 	unsigned long last_accessed;
 	unsigned dirty_start;
 	unsigned dirty_end;
+	unsigned dirty_min;
+	unsigned dirty_max;
 	unsigned write_start;
 	unsigned write_end;
 	struct dm_bufio_client *c;
@@ -854,6 +859,12 @@ enum new_flag {
 	NF_PREFETCH = 3
 };
 
+enum action_type {
+	ACTION_NONE,
+	ACTION_SUBMIT,
+	ACTION_CLEANUP
+};
+
 /*
  * Allocate a new buffer. If the allocation is not possible, wait until
  * some other thread frees a buffer.
@@ -983,12 +994,12 @@ static void __check_watermark(struct dm_bufio_client *c,
  *--------------------------------------------------------------*/
 
 static struct dm_buffer *__bufio_new(struct dm_bufio_client *c, sector_t block,
-				     enum new_flag nf, int *need_submit,
+				     enum new_flag nf, enum action_type *action,
 				     struct list_head *write_list)
 {
 	struct dm_buffer *b, *new_b = NULL;
 
-	*need_submit = 0;
+	*action = ACTION_NONE;
 
 	b = __find(c, block);
 	if (b)
@@ -1015,17 +1026,19 @@ static struct dm_buffer *__bufio_new(struct dm_bufio_client *c, sector_t block,
 
 	b = new_b;
 	b->hold_count = 1;
+	atomic_set(&b->external_count, 0);
 	b->read_error = 0;
 	b->write_error = 0;
+	b->dirty_max = 0;
 	__link_buffer(b, block, LIST_CLEAN);
 
 	if (nf == NF_FRESH) {
-		b->state = 0;
+		b->state = 1 << B_PARTIAL;
 		return b;
 	}
 
 	b->state = 1 << B_READING;
-	*need_submit = 1;
+	*action = ACTION_SUBMIT;
 
 	return b;
 
@@ -1041,6 +1054,16 @@ found_buffer:
 	 */
 	if (nf == NF_GET && unlikely(test_bit(B_READING, &b->state)))
 		return NULL;
+
+	if (nf == NF_GET && test_bit(B_PARTIAL, &b->state))
+		return NULL;
+
+	if (nf != NF_FRESH && test_bit(B_PARTIAL, &b->state)) {
+		clear_bit(B_PARTIAL, &b->state);
+		set_bit(B_CLEANING, &b->state);
+
+		*action = ACTION_CLEANUP;
+	}
 
 	b->hold_count++;
 	__relink_lru(b, test_bit(B_DIRTY, &b->state) ||
@@ -1066,21 +1089,87 @@ static void read_endio(struct dm_buffer *b, blk_status_t status)
 }
 
 /*
+ * Routine for converting a partial buffer to a full one:
+ */
+static void cleanup_partial_buffer(struct dm_bufio_client *c, struct dm_buffer *b)
+{
+	struct dm_buffer *shadow;
+
+	dm_bufio_lock(c);
+
+	BUG_ON(test_bit(B_READING, &b->state));
+	BUG_ON(test_bit(B_DIRTY, &b->state) && !b->dirty_max);
+
+	/*
+	 * Already read in the background to a shadow buffer.
+	 */
+	shadow = __alloc_buffer_wait_no_callback(c, NF_READ);
+	shadow->block = b->block;
+	shadow->hold_count = 1;
+	atomic_set(&shadow->external_count, 0);
+	shadow->read_error = 0;
+	shadow->write_error = 0;
+	shadow->dirty_max = 0;
+	shadow->state = 1 << B_READING;
+
+	dm_bufio_unlock(c);
+
+	submit_io(shadow, REQ_OP_READ, read_endio);
+
+	/*
+	 * Wait until there are no external holders so we have exclusive
+	 * access to the buffer.
+	 */
+	smp_mb();
+	if (atomic_read(&b->external_count)) {
+		dm_bufio_lock(c);
+		while (atomic_read(&b->external_count)) {
+			__wait_for_free_buffer(c);
+			smp_mb();
+		}
+		dm_bufio_unlock(c);
+	}
+
+	wait_on_bit_io(&shadow->state, B_READING, TASK_UNINTERRUPTIBLE);
+	if (shadow->read_error) {
+		b->read_error = shadow->read_error;
+		goto out;
+	}
+
+	if (b->dirty_max) {
+		memcpy(b->data, shadow->data, b->dirty_min);
+		memcpy(b->data + b->dirty_max, shadow->data + b->dirty_max, c->block_size - b->dirty_max);
+	} else {
+		memcpy(b->data, shadow->data, c->block_size);
+	}
+
+out:
+	dm_bufio_lock(c);
+	__free_buffer_wake(shadow);
+	dm_bufio_unlock(c);
+
+	smp_mb__before_atomic();
+	clear_bit(B_CLEANING, &b->state);
+	smp_mb__after_atomic();
+
+	wake_up_bit(&b->state, B_CLEANING);
+}
+
+/*
  * A common routine for dm_bufio_new and dm_bufio_read.  Operation of these
  * functions is similar except that dm_bufio_new doesn't read the
- * buffer from the disk (assuming that the caller overwrites all the data
- * and uses dm_bufio_mark_buffer_dirty to write new data back).
+ * buffer from the disk.
  */
 static void *new_read(struct dm_bufio_client *c, sector_t block,
 		      enum new_flag nf, struct dm_buffer **bp)
 {
-	int need_submit;
+	enum action_type action;
 	struct dm_buffer *b;
 
 	LIST_HEAD(write_list);
 
 	dm_bufio_lock(c);
-	b = __bufio_new(c, block, nf, &need_submit, &write_list);
+	b = __bufio_new(c, block, nf, &action, &write_list);
 #ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
 	if (b && b->hold_count == 1)
 		buffer_record_stack(b);
@@ -1092,10 +1181,19 @@ static void *new_read(struct dm_bufio_client *c, sector_t block,
 	if (!b)
 		return NULL;
 
-	if (need_submit)
+	if (action == ACTION_SUBMIT) {
 		submit_io(b, REQ_OP_READ, read_endio);
+		wait_on_bit_io(&b->state, B_READING, TASK_UNINTERRUPTIBLE);
+	} else if (action == ACTION_CLEANUP) {
+		cleanup_partial_buffer(c, b);
+	} else {
+		wait_on_bit_io(&b->state, B_CLEANING, TASK_UNINTERRUPTIBLE);
+		wait_on_bit_io(&b->state, B_READING, TASK_UNINTERRUPTIBLE);
+	}
 
-	wait_on_bit_io(&b->state, B_READING, TASK_UNINTERRUPTIBLE);
+	smp_mb__before_atomic();
+	atomic_inc(&b->external_count);
+	smp_mb__after_atomic();
 
 	if (b->read_error) {
 		int error = blk_status_to_errno(b->read_error);
@@ -1148,10 +1246,9 @@ void dm_bufio_prefetch(struct dm_bufio_client *c,
 	dm_bufio_lock(c);
 
 	for (; n_blocks--; block++) {
-		int need_submit;
+		enum action_type action;
 		struct dm_buffer *b;
-		b = __bufio_new(c, block, NF_PREFETCH, &need_submit,
-				&write_list);
+		b = __bufio_new(c, block, NF_PREFETCH, &action, &write_list);
 		if (unlikely(!list_empty(&write_list))) {
 			dm_bufio_unlock(c);
 			blk_finish_plug(&plug);
@@ -1161,9 +1258,12 @@ void dm_bufio_prefetch(struct dm_bufio_client *c,
 		}
 		if (unlikely(b != NULL)) {
 			dm_bufio_unlock(c);
+			BUG_ON(action == ACTION_CLEANUP);
 
-			if (need_submit)
+			if (action == ACTION_SUBMIT)
 				submit_io(b, REQ_OP_READ, read_endio);
+
+			atomic_inc(&b->external_count);
 			dm_bufio_release(b);
 
 			cond_resched();
@@ -1184,6 +1284,10 @@ EXPORT_SYMBOL_GPL(dm_bufio_prefetch);
 void dm_bufio_release(struct dm_buffer *b)
 {
 	struct dm_bufio_client *c = b->c;
+
+	smp_mb__before_atomic();
+	atomic_dec(&b->external_count);
+	smp_mb__after_atomic();
 
 	dm_bufio_lock(c);
 
@@ -1218,6 +1322,7 @@ void dm_bufio_mark_partial_buffer_dirty(struct dm_buffer *b,
 
 	BUG_ON(start >= end);
 	BUG_ON(end > b->c->block_size);
+	BUG_ON(!end);
 
 	dm_bufio_lock(c);
 
@@ -1233,6 +1338,19 @@ void dm_bufio_mark_partial_buffer_dirty(struct dm_buffer *b,
 		if (end > b->dirty_end)
 			b->dirty_end = end;
 	}
+
+	if (b->dirty_max == 0) {
+		b->dirty_min = start;
+		b->dirty_max = end;
+	} else {
+		if (start < b->dirty_min)
+			b->dirty_min = start;
+		if (end > b->dirty_max)
+			b->dirty_max = end;
+	}
+
+	if (b->dirty_min == 0 && b->dirty_max == c->block_size)
+		clear_bit(B_PARTIAL, &b->state);
 
 	dm_bufio_unlock(c);
 }
