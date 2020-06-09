@@ -55,7 +55,7 @@
  * Align buffer writes to this boundary.
  * Tests show that SSDs have the highest IOPS when using 4k writes.
  */
-#define DM_BUFIO_WRITE_ALIGN		4096
+#define DM_BUFIO_DEFAULT_WRITE_ALIGN    4096
 
 /*
  * dm_buffer->list_mode
@@ -87,6 +87,7 @@ struct dm_bufio_client {
 
 	struct block_device *bdev;
 	unsigned block_size;
+	unsigned log2_write_align;
 	s8 sectors_per_block_bits;
 	void (*alloc_callback)(struct dm_buffer *);
 	void (*write_callback)(struct dm_buffer *);
@@ -631,6 +632,16 @@ dmio:
 	submit_bio(bio);
 }
 
+static void align_write(struct dm_bufio_client *c, unsigned *offset, unsigned *end)
+{
+	int write_align = 1 << c->log2_write_align;
+	*offset &= -write_align;
+	*end += write_align - 1;
+	*end &= -write_align;
+	if (unlikely(*end > c->block_size))
+		*end = c->block_size;
+}
+
 static void submit_io(struct dm_buffer *b, int rw, void (*end_io)(struct dm_buffer *, blk_status_t))
 {
 	unsigned n_sectors;
@@ -653,11 +664,7 @@ static void submit_io(struct dm_buffer *b, int rw, void (*end_io)(struct dm_buff
 			b->c->write_callback(b);
 		offset = b->write_start;
 		end = b->write_end;
-		offset &= -DM_BUFIO_WRITE_ALIGN;
-		end += DM_BUFIO_WRITE_ALIGN - 1;
-		end &= -DM_BUFIO_WRITE_ALIGN;
-		if (unlikely(end > b->c->block_size))
-			end = b->c->block_size;
+		align_write(b->c, &offset, &end);
 
 		sector += offset >> SECTOR_SHIFT;
 		n_sectors = (end - offset) >> SECTOR_SHIFT;
@@ -1429,6 +1436,12 @@ void dm_bufio_set_minimum_buffers(struct dm_bufio_client *c, unsigned n)
 }
 EXPORT_SYMBOL_GPL(dm_bufio_set_minimum_buffers);
 
+unsigned dm_bufio_get_alignment(struct dm_bufio_client *c)
+{
+	return 1 << c->log2_write_align;
+}
+EXPORT_SYMBOL_GPL(dm_bufio_get_alignment);
+
 unsigned dm_bufio_get_block_size(struct dm_bufio_client *c)
 {
 	return c->block_size;
@@ -1604,6 +1617,7 @@ dm_bufio_shrink_count(struct shrinker *shrink, struct shrink_control *sc)
  */
 struct dm_bufio_client *dm_bufio_client_create(struct block_device *bdev, unsigned block_size,
 					       unsigned reserved_buffers, unsigned aux_size,
+					       unsigned write_align,
 					       void (*alloc_callback)(struct dm_buffer *),
 					       void (*write_callback)(struct dm_buffer *))
 {
@@ -1614,6 +1628,12 @@ struct dm_bufio_client *dm_bufio_client_create(struct block_device *bdev, unsign
 
 	if (!block_size || block_size & ((1 << SECTOR_SHIFT) - 1)) {
 		DMERR("%s: block size not specified or is not multiple of 512b", __func__);
+		r = -EINVAL;
+		goto bad_client;
+	}
+
+	if (write_align && (write_align < 1 << SECTOR_SHIFT || write_align & (write_align - 1))) {
+		DMERR("%s: Invalid write_align", __func__);
 		r = -EINVAL;
 		goto bad_client;
 	}
@@ -1631,6 +1651,11 @@ struct dm_bufio_client *dm_bufio_client_create(struct block_device *bdev, unsign
 		c->sectors_per_block_bits = __ffs(block_size) - SECTOR_SHIFT;
 	else
 		c->sectors_per_block_bits = -1;
+
+	if (!write_align)
+		write_align = DM_BUFIO_DEFAULT_WRITE_ALIGN;
+	write_align = min(write_align, block_size);
+	c->log2_write_align = __ffs(write_align);
 
 	c->alloc_callback = alloc_callback;
 	c->write_callback = write_callback;

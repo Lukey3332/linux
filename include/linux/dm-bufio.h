@@ -23,6 +23,7 @@ struct dm_buffer;
 struct dm_bufio_client *
 dm_bufio_client_create(struct block_device *bdev, unsigned block_size,
 		       unsigned reserved_buffers, unsigned aux_size,
+		       unsigned write_align,
 		       void (*alloc_callback)(struct dm_buffer *),
 		       void (*write_callback)(struct dm_buffer *));
 
@@ -137,6 +138,7 @@ void dm_bufio_forget(struct dm_bufio_client *c, sector_t block);
 void dm_bufio_set_minimum_buffers(struct dm_bufio_client *c, unsigned n);
 
 unsigned dm_bufio_get_block_size(struct dm_bufio_client *c);
+unsigned dm_bufio_get_alignment(struct dm_bufio_client *c);
 sector_t dm_bufio_get_device_size(struct dm_bufio_client *c);
 sector_t dm_bufio_get_block_number(struct dm_buffer *b);
 void *dm_bufio_get_block_data(struct dm_buffer *b);
