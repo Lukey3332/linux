@@ -104,6 +104,13 @@ void dm_bufio_mark_partial_buffer_dirty(struct dm_buffer *b,
 					unsigned start, unsigned end);
 
 /*
+ * Check if exactly the specified part will be written with
+ * dm_bufio_mark_partial_buffer_dirty.
+ */
+int dm_bufio_is_valid_partial_write(struct dm_bufio_client *c,
+				    unsigned start, unsigned end);
+
+/*
  * Initiate writing of dirty buffers, without waiting for completion.
  */
 void dm_bufio_write_dirty_buffers_async(struct dm_bufio_client *c);

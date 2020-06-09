@@ -1399,6 +1399,23 @@ void dm_bufio_mark_partial_buffer_dirty(struct dm_buffer *b,
 }
 EXPORT_SYMBOL_GPL(dm_bufio_mark_partial_buffer_dirty);
 
+int dm_bufio_is_valid_partial_write(struct dm_bufio_client *c,
+				    unsigned start, unsigned end)
+{
+	unsigned start_copy, end_copy;
+
+	BUG_ON(start >= end);
+	BUG_ON(end > c->block_size);
+
+	start_copy = start;
+	end_copy = end;
+	align_write(c, &start_copy, &end_copy);
+	if (unlikely(end_copy > c->block_size))
+		end_copy = c->block_size;
+	return (start == start_copy && end == end_copy);
+}
+EXPORT_SYMBOL_GPL(dm_bufio_is_valid_partial_write);
+
 void dm_bufio_mark_buffer_dirty(struct dm_buffer *b)
 {
 	dm_bufio_mark_partial_buffer_dirty(b, 0, b->c->block_size);
