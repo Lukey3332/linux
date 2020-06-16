@@ -2199,8 +2199,13 @@ static void integrity_commit(struct work_struct *w)
 	flushes = bio_list_get(&ic->flush_bio_list);
 	if (unlikely(ic->mode != 'J')) {
 		spin_unlock_irq(&ic->endio_wait.lock);
-		dm_integrity_flush_buffers(ic);
-		if (ic->meta_dev)
+		/*
+		* Flushing the metadata in bitmap mode is pointless, because
+		* it is going to be recalculated anyway after a crash.
+		*/
+		if (ic->mode != 'B')
+			dm_integrity_flush_buffers(ic);
+		if (ic->meta_dev || ic->mode == 'B')
 			blkdev_issue_flush(ic->dev->bdev, GFP_NOIO, NULL);
 		goto release_flush_bios;
 	}
