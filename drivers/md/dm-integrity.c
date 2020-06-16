@@ -1459,9 +1459,6 @@ static void dec_in_flight(struct dm_integrity_io *dio)
 
 		remove_range(ic, &dio->range);
 
-		if (dio->op == REQ_OP_WRITE || unlikely(dio->op == REQ_OP_DISCARD))
-			schedule_autocommit(ic);
-
 		bio = dm_bio_from_per_bio_data(dio, sizeof(struct dm_integrity_io));
 
 		if (unlikely(dio->bi_status) && !bio->bi_status)
