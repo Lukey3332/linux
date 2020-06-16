@@ -2196,6 +2196,8 @@ static void integrity_commit(struct work_struct *w)
 	if (unlikely(ic->mode != 'J')) {
 		spin_unlock_irq(&ic->endio_wait.lock);
 		dm_integrity_flush_buffers(ic);
+		if (ic->meta_dev)
+			blkdev_issue_flush(ic->dev->bdev, GFP_NOIO);
 		goto release_flush_bios;
 	}
 
@@ -2410,6 +2412,9 @@ skip_io:
 	wait_for_completion_io(&comp.comp);
 
 	dm_integrity_flush_buffers(ic);
+	if (ic->meta_dev)
+		blkdev_issue_flush(ic->dev->bdev, GFP_NOIO);
+
 }
 
 static void integrity_writer(struct work_struct *w)
@@ -2948,6 +2953,9 @@ static void dm_integrity_postsuspend(struct dm_target *ti)
 			dm_integrity_io_error(ic, "writing superblock", r);
 #endif
 	}
+
+	if (ic->meta_dev)
+		blkdev_issue_flush(ic->dev->bdev, GFP_NOIO);
 
 	BUG_ON(!RB_EMPTY_ROOT(&ic->in_progress));
 
