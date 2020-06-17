@@ -39,6 +39,7 @@
 #define RECALC_SECTORS			8192
 #define RECALC_WRITE_SUPER		16
 #define BITMAP_BLOCK_SIZE		4096	/* don't change it */
+#define BITMAP_MIN_FLUSH_INTERVAL	(8 * HZ)
 #define BITMAP_FLUSH_INTERVAL		(10 * HZ)
 #define DISCARD_FILLER			0xf6
 
@@ -173,9 +174,12 @@ struct dm_integrity_c {
 	struct page_list *may_write_bitmap;
 	struct bitmap_block_status *bbs;
 	unsigned bitmap_flush_interval;
+	unsigned bitmap_min_flush_interval;
+	struct timer_list bitmap_min_flush_timer;
 	int synchronous_mode;
 	struct bio_list synchronous_bios;
 	struct delayed_work bitmap_flush_work;
+	struct work_struct bitmap_flush_and_commit_work;
 
 	struct crypto_skcipher *journal_crypt;
 	struct scatterlist **journal_scatterlist;
@@ -1450,7 +1454,11 @@ static void submit_flush_bio(struct dm_integrity_c *ic, struct dm_integrity_io *
 	bio_list_add(&ic->flush_bio_list, bio);
 	spin_unlock_irqrestore(&ic->endio_wait.lock, flags);
 
-	queue_work(ic->commit_wq, &ic->commit_work);
+	if (ic->mode == 'B' && !timer_pending(&ic->bitmap_min_flush_timer)
+	    && cancel_delayed_work(&ic->bitmap_flush_work))
+		queue_work(ic->commit_wq, &ic->bitmap_flush_and_commit_work);
+	else
+		queue_work(ic->commit_wq, &ic->commit_work);
 }
 
 static void do_endio(struct dm_integrity_c *ic, struct bio *bio)
@@ -2683,6 +2691,8 @@ static void bitmap_block_work(struct work_struct *w)
 		queue_work(ic->offload_wq, &dio->work);
 	}
 
+	if (!timer_pending(&ic->bitmap_min_flush_timer))
+		mod_timer(&ic->bitmap_min_flush_timer, jiffies + ic->bitmap_min_flush_interval);
 	queue_delayed_work(ic->commit_wq, &ic->bitmap_flush_work, ic->bitmap_flush_interval);
 }
 
@@ -2729,6 +2739,26 @@ static void bitmap_flush_work(struct work_struct *work)
 	spin_unlock_irq(&ic->endio_wait.lock);
 }
 
+static void bitmap_flush_and_commit_work(struct work_struct *work)
+{
+	struct dm_integrity_c *ic = container_of(work, struct dm_integrity_c, bitmap_flush_and_commit_work);
+	struct bio *flushes;
+
+	del_timer(&ic->bitmap_min_flush_timer);
+
+	spin_lock_irq(&ic->endio_wait.lock);
+	flushes = bio_list_get(&ic->flush_bio_list);
+	spin_unlock_irq(&ic->endio_wait.lock);
+
+	bitmap_flush_work(&ic->bitmap_flush_work.work);
+
+	while (flushes) {
+		struct bio *next = flushes->bi_next;
+		flushes->bi_next = NULL;
+		do_endio(ic, flushes);
+		flushes = next;
+	}
+}
 
 static void init_journal(struct dm_integrity_c *ic, unsigned start_section,
 			 unsigned n_sections, unsigned char commit_seq)
@@ -2959,6 +2989,7 @@ static void dm_integrity_postsuspend(struct dm_target *ti)
 	WARN_ON(unregister_reboot_notifier(&ic->reboot_notifier));
 
 	del_timer_sync(&ic->autocommit_timer);
+	del_timer_sync(&ic->bitmap_min_flush_timer);
 
 	if (ic->recalc_wq)
 		drain_workqueue(ic->recalc_wq);
@@ -3781,6 +3812,11 @@ bad:
 	return r;
 }
 
+static void dummy_cb(struct timer_list *t)
+{
+	// Noop.
+}
+
 /*
  * Construct a integrity mapping
  *
@@ -3848,6 +3884,7 @@ static int dm_integrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	init_completion(&ic->crypto_backoff);
 	atomic64_set(&ic->number_of_mismatches, 0);
 	ic->bitmap_flush_interval = BITMAP_FLUSH_INTERVAL;
+	ic->bitmap_min_flush_interval = BITMAP_MIN_FLUSH_INTERVAL;
 
 	r = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &ic->dev);
 	if (r) {
@@ -3950,6 +3987,12 @@ static int dm_integrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 				ti->error = "Invalid bitmap_flush_interval argument";
 			}
 			ic->bitmap_flush_interval = msecs_to_jiffies(val);
+		} else if (sscanf(opt_string, "bitmap_min_flush_interval:%u%c", &val, &dummy) == 1) {
+			if (val >= (uint64_t)UINT_MAX * 1000 / HZ) {
+				r = -EINVAL;
+				ti->error = "Invalid bitmap_min_flush_interval argument";
+			}
+			ic->bitmap_min_flush_interval = msecs_to_jiffies(val);
 		} else if (!strncmp(opt_string, "internal_hash:", strlen("internal_hash:"))) {
 			r = get_alg_and_key(opt_string, &ic->internal_hash_alg, &ti->error,
 					    "Invalid internal_hash argument");
@@ -4307,6 +4350,10 @@ try_smaller_buffer:
 			r = -ENOMEM;
 			goto bad;
 		}
+
+		timer_setup(&ic->bitmap_min_flush_timer, dummy_cb, 0);
+		INIT_WORK(&ic->bitmap_flush_and_commit_work, bitmap_flush_and_commit_work);
+
 		INIT_DELAYED_WORK(&ic->bitmap_flush_work, bitmap_flush_work);
 		for (i = 0; i < ic->n_bitmap_blocks; i++) {
 			struct bitmap_block_status *bbs = &ic->bbs[i];
