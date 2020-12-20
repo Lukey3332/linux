@@ -2660,6 +2660,8 @@ static void bitmap_flush_work(struct work_struct *work)
 	struct bio *bio;
 
 	dm_integrity_flush_buffers(ic);
+	if (ic->meta_dev)
+		blkdev_issue_flush(ic->dev->bdev, GFP_NOIO);
 
 	range.logical_sector = 0;
 	range.n_sectors = ic->provided_data_sectors;
