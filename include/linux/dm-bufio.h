@@ -78,6 +78,19 @@ void dm_bufio_prefetch(struct dm_bufio_client *c,
 		       sector_t block, unsigned n_blocks);
 
 /*
+ * Copies from src into the buffer for block. Doesn't read the buffer if
+ * the part to write is properly aligned and doesn't create unwritten holes
+ * in the buffer.
+ * Does the same as the following sequence:
+ * void *dst = dm_bufio_read(c, block, &b);
+ * memcpy(dst + start, src, end - start);
+ * dm_bufio_mark_partial_buffer_dirty(b, start, end);
+ * dm_bufio_release(b);
+ */
+int dm_bufio_copyin(struct dm_bufio_client *c, void *src, sector_t block,
+		    unsigned start, unsigned end);
+
+/*
  * Release a reference obtained with dm_bufio_{read,get,new}. The data
  * pointer and dm_buffer pointer is no longer valid after this call.
  */
