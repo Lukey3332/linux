@@ -78,6 +78,12 @@ void dm_bufio_prefetch(struct dm_bufio_client *c,
 		       sector_t block, unsigned n_blocks);
 
 /*
+ * Copies from src into the buffer for block.
+ */
+int dm_bufio_copyin(struct dm_bufio_client *c, void *src, sector_t block,
+		    unsigned start, unsigned end);
+
+/*
  * Release a reference obtained with dm_bufio_{read,get,new}. The data
  * pointer and dm_buffer pointer is no longer valid after this call.
  */

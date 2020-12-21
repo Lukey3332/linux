@@ -675,6 +675,15 @@ static inline sector_t block_to_sector(struct dm_bufio_client *c, sector_t block
 	return sector;
 }
 
+static void align_write(struct dm_bufio_client *c, unsigned *offset, unsigned *end)
+{
+	*offset &= -DM_BUFIO_WRITE_ALIGN;
+	*end += DM_BUFIO_WRITE_ALIGN - 1;
+	*end &= -DM_BUFIO_WRITE_ALIGN;
+	if (unlikely(*end > c->block_size))
+		*end = c->block_size;
+}
+
 static void submit_io(struct dm_buffer *b, int rw, void (*end_io)(struct dm_buffer *, blk_status_t))
 {
 	unsigned n_sectors;
@@ -693,11 +702,7 @@ static void submit_io(struct dm_buffer *b, int rw, void (*end_io)(struct dm_buff
 			b->c->write_callback(b);
 		offset = b->write_start;
 		end = b->write_end;
-		offset &= -DM_BUFIO_WRITE_ALIGN;
-		end += DM_BUFIO_WRITE_ALIGN - 1;
-		end &= -DM_BUFIO_WRITE_ALIGN;
-		if (unlikely(end > b->c->block_size))
-			end = b->c->block_size;
+		align_write(b->c, &offset, &end);
 
 		sector += offset >> SECTOR_SHIFT;
 		n_sectors = (end - offset) >> SECTOR_SHIFT;
@@ -1280,6 +1285,55 @@ flush_plug:
 	blk_finish_plug(&plug);
 }
 EXPORT_SYMBOL_GPL(dm_bufio_prefetch);
+
+int dm_bufio_copyin(struct dm_bufio_client *c, void *src, sector_t block,
+		    unsigned start, unsigned end)
+{
+	unsigned start_copy, end_copy;
+	enum new_flag nf;
+	void *dst;
+	struct dm_buffer *b;
+
+	BUG_ON(dm_bufio_in_request());
+	BUG_ON(start >= end);
+	BUG_ON(end > c->block_size);
+	BUG_ON(!end);
+
+	dm_bufio_lock(c);
+
+	/*
+	 * First check if exactly the specified part will be written and that
+	 * it does not create holes in the buffer.
+	 */
+
+	nf = NF_FRESH;
+	b = __find(c, block);
+	if (b && test_bit(B_PARTIAL, &b->state) && b->dirty_max != 0) {
+		if (end + 1 < b->dirty_min || start > b->dirty_max + 1) {
+			nf = NF_READ;
+		}
+	}
+
+	start_copy = start;
+	end_copy = end;
+	align_write(c, &start_copy, &end_copy);
+	if (start != start_copy || end != end_copy)
+		nf = NF_READ;
+
+	dm_bufio_unlock(c);
+
+	dst = new_read(c, block, nf, &b);
+	if (IS_ERR(dst))
+		return PTR_ERR(dst);
+
+	memcpy(dst + start, src, end - start);
+
+	dm_bufio_mark_partial_buffer_dirty(b, start, end);
+	dm_bufio_release(b);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(dm_bufio_copyin);
 
 void dm_bufio_release(struct dm_buffer *b)
 {
