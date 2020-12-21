@@ -1165,15 +1165,14 @@ out:
  * functions is similar except that dm_bufio_new doesn't read the
  * buffer from the disk.
  */
-static void *new_read(struct dm_bufio_client *c, sector_t block,
-		      enum new_flag nf, struct dm_buffer **bp)
+static void *new_read_droplock(struct dm_bufio_client *c, sector_t block,
+			       enum new_flag nf, struct dm_buffer **bp)
 {
 	enum action_type action;
 	struct dm_buffer *b;
 
 	LIST_HEAD(write_list);
 
-	dm_bufio_lock(c);
 	b = __bufio_new(c, block, nf, &action, &write_list);
 #ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
 	if (b && b->hold_count == 1)
@@ -1211,6 +1210,14 @@ static void *new_read(struct dm_bufio_client *c, sector_t block,
 	*bp = b;
 
 	return b->data;
+}
+
+static void *new_read(struct dm_bufio_client *c, sector_t block,
+		      enum new_flag nf, struct dm_buffer **bp)
+{
+	dm_bufio_lock(c);
+
+	return new_read_droplock(c, block, nf, bp);
 }
 
 void *dm_bufio_get(struct dm_bufio_client *c, sector_t block,
@@ -1320,9 +1327,7 @@ int dm_bufio_copyin(struct dm_bufio_client *c, void *src, sector_t block,
 	if (start != start_copy || end != end_copy)
 		nf = NF_READ;
 
-	dm_bufio_unlock(c);
-
-	dst = new_read(c, block, nf, &b);
+	dst = new_read_droplock(c, block, nf, &b);
 	if (IS_ERR(dst))
 		return PTR_ERR(dst);
 
