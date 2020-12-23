@@ -1301,6 +1301,7 @@ int dm_bufio_copyin(struct dm_bufio_client *c, void *src, sector_t block,
 	enum new_flag nf;
 	void *dst;
 	struct dm_buffer *b;
+	int was_partial;
 
 	BUG_ON(dm_bufio_in_request());
 	BUG_ON(start >= end);
@@ -1315,8 +1316,10 @@ int dm_bufio_copyin(struct dm_bufio_client *c, void *src, sector_t block,
 	 */
 
 	nf = NF_FRESH;
+	was_partial = 0;
 	b = __find(c, block);
 	if (b && test_bit(B_PARTIAL, &b->state) && b->dirty_max != 0) {
+		was_partial = 1;
 		if (end + 1 < b->dirty_min || start > b->dirty_max + 1) {
 			nf = NF_READ;
 		}
@@ -1336,6 +1339,11 @@ int dm_bufio_copyin(struct dm_bufio_client *c, void *src, sector_t block,
 
 	dm_bufio_mark_partial_buffer_dirty(b, start, end);
 	dm_bufio_release(b);
+	if (was_partial && !test_bit(B_PARTIAL, &b->state)) {
+		dm_bufio_lock(c);
+		__write_dirty_buffer(b, NULL);
+		dm_bufio_unlock(c);
+	}
 
 	return 0;
 }
