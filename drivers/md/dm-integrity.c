@@ -421,7 +421,7 @@ static __u64 get_metadata_sector_and_offset(struct dm_integrity_c *ic, sector_t 
 	__u64 ms;
 	unsigned mo;
 
-	ms = area << ic->sb->log2_interleave_sectors;
+	ms = (area + 1) << ic->sb->log2_interleave_sectors;
 	if (likely(ic->log2_metadata_run >= 0))
 		ms += area << ic->log2_metadata_run;
 	else
@@ -450,9 +450,9 @@ static sector_t get_data_sector(struct dm_integrity_c *ic, sector_t area, sector
 
 	result = area << ic->sb->log2_interleave_sectors;
 	if (likely(ic->log2_metadata_run >= 0))
-		result += (area + 1) << ic->log2_metadata_run;
+		result += area << ic->log2_metadata_run;
 	else
-		result += (area + 1) * ic->metadata_run;
+		result += area * ic->metadata_run;
 
 	result += (sector_t)ic->initial_sectors + offset;
 	result += ic->start;
@@ -3230,7 +3230,7 @@ static int calculate_device_limits(struct dm_integrity_c *ic)
 			ic->log2_metadata_run = -1;
 
 		get_area_and_offset(ic, ic->provided_data_sectors - 1, &last_area, &last_offset);
-		last_sector = get_data_sector(ic, last_area, last_offset);
+		last_sector = get_data_sector(ic, last_area, last_offset) + (1 << ic->sb->log2_interleave_sectors);
 		if (last_sector < ic->start || last_sector >= ic->meta_device_sectors)
 			return -EINVAL;
 	} else {
