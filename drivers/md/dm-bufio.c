@@ -87,7 +87,8 @@ struct dm_bufio_client {
 
 	struct block_device *bdev;
 	unsigned block_size;
-	int write_align;
+	unsigned log2_write_align;
+	unsigned bitmap_bits;
 	s8 sectors_per_block_bits;
 	void (*alloc_callback)(struct dm_buffer *);
 	void (*write_callback)(struct dm_buffer *);
@@ -151,12 +152,10 @@ struct dm_buffer {
 	atomic_t external_count;
 	unsigned long state;
 	unsigned long last_accessed;
-	unsigned dirty_start;
-	unsigned dirty_end;
-	unsigned dirty_min;
-	unsigned dirty_max;
-	unsigned write_start;
-	unsigned write_end;
+	unsigned long *dirty_bitmap;
+	unsigned long *write_bitmap;
+	unsigned long *alloc_bitmap;
+	atomic_t to_write;
 	struct dm_bufio_client *c;
 	struct list_head write_list;
 	void (*end_io)(struct dm_buffer *, blk_status_t);
@@ -486,6 +485,22 @@ static struct dm_buffer *alloc_buffer(struct dm_bufio_client *c, gfp_t gfp_mask)
 		return NULL;
 	}
 
+	b->dirty_bitmap = bitmap_alloc(c->bitmap_bits, gfp_mask);
+	b->write_bitmap = bitmap_alloc(c->bitmap_bits, gfp_mask);
+	b->alloc_bitmap = bitmap_alloc(c->bitmap_bits, gfp_mask);
+	if (!(b->dirty_bitmap && b->write_bitmap && b->alloc_bitmap)) {
+		if(b->dirty_bitmap)
+			bitmap_free(b->dirty_bitmap);
+		if(b->write_bitmap)
+			bitmap_free(b->write_bitmap);
+		if(b->alloc_bitmap)
+			bitmap_free(b->alloc_bitmap);
+		free_buffer_data(c, b->data, b->data_mode);
+		kmem_cache_free(c->slab_buffer, b);
+		return NULL;
+	}
+
+
 #ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
 	b->stack_len = 0;
 #endif
@@ -499,6 +514,9 @@ static void free_buffer(struct dm_buffer *b)
 {
 	struct dm_bufio_client *c = b->c;
 
+	bitmap_free(b->alloc_bitmap);
+	bitmap_free(b->write_bitmap);
+	bitmap_free(b->dirty_bitmap);
 	free_buffer_data(c, b->data, b->data_mode);
 	kmem_cache_free(c->slab_buffer, b);
 }
@@ -678,41 +696,73 @@ static inline sector_t block_to_sector(struct dm_bufio_client *c, sector_t block
 
 static void align_write(struct dm_bufio_client *c, unsigned *offset, unsigned *end)
 {
-	*offset &= -c->write_align;
-	*end += c->write_align - 1;
-	*end &= -c->write_align;
-	if (unlikely(*end > c->block_size))
-		*end = c->block_size;
+	int write_align = 1 << c->log2_write_align;
+	*offset &= -write_align;
+	*end += write_align - 1;
+	*end &= -write_align;
 }
 
 static void submit_io(struct dm_buffer *b, int rw, void (*end_io)(struct dm_buffer *, blk_status_t))
 {
+	struct dm_bufio_client *c = b->c;
 	unsigned n_sectors;
-	sector_t sector;
+	sector_t sector, base_sector;
+	unsigned rs, re;
 	unsigned offset, end;
+	unsigned to_write;
+	void (*io)(struct dm_buffer *b, int rw, sector_t sector,
+		   unsigned n_sectors, unsigned offset);
 
 	b->end_io = end_io;
 
-	sector = block_to_sector(b->c, b->block);
+	base_sector = block_to_sector(b->c, b->block);
+
+	if (b->data_mode != DATA_MODE_VMALLOC)
+		io = use_bio;
+	else
+		io = use_dmio;
 
 	if (rw != REQ_OP_WRITE) {
-		n_sectors = b->c->block_size >> SECTOR_SHIFT;
+		n_sectors = c->block_size >> SECTOR_SHIFT;
 		offset = 0;
+		io(b, rw, base_sector, n_sectors, offset);
 	} else {
 		if (b->c->write_callback)
 			b->c->write_callback(b);
-		offset = b->write_start;
-		end = b->write_end;
-		align_write(b->c, &offset, &end);
 
-		sector += offset >> SECTOR_SHIFT;
-		n_sectors = (end - offset) >> SECTOR_SHIFT;
+		if (!test_bit(B_PARTIAL, &b->state)) {
+			rs = 0;
+			bitmap_next_set_region(b->write_bitmap, &rs, &re, c->bitmap_bits);
+			offset = rs << c->log2_write_align; // rs * write_align
+			bitmap_for_each_set_region (b->write_bitmap, rs, re, 0, c->bitmap_bits) {
+				end = re << c->log2_write_align;
+			}
+			if (unlikely(end > c->block_size))
+				end = c->block_size;
+			atomic_set(&b->to_write, 1);
+
+			sector = base_sector + (offset >> SECTOR_SHIFT);
+			n_sectors = (end - offset) >> SECTOR_SHIFT;
+			io(b, rw, sector, n_sectors, offset);
+		} else {
+			to_write = 0;
+			bitmap_for_each_set_region (b->write_bitmap, rs, re, 0, c->bitmap_bits) {
+				to_write++;
+			}
+			atomic_set(&b->to_write, to_write);
+
+			bitmap_for_each_set_region (b->write_bitmap, rs, re, 0, c->bitmap_bits) {
+				offset = rs << c->log2_write_align; // rs * write_align
+				end = re << c->log2_write_align;
+				if (unlikely(end > c->block_size))
+					end = c->block_size;
+
+				sector = base_sector + (offset >> SECTOR_SHIFT);
+				n_sectors = (end - offset) >> SECTOR_SHIFT;
+				io(b, rw, sector, n_sectors, offset);
+			}
+		}
 	}
-
-	if (b->data_mode != DATA_MODE_VMALLOC)
-		use_bio(b, rw, sector, n_sectors, offset);
-	else
-		use_dmio(b, rw, sector, n_sectors, offset);
 }
 
 /*----------------------------------------------------------------
@@ -737,11 +787,13 @@ static void write_endio(struct dm_buffer *b, blk_status_t status)
 
 	BUG_ON(!test_bit(B_WRITING, &b->state));
 
-	smp_mb__before_atomic();
-	clear_bit(B_WRITING, &b->state);
-	smp_mb__after_atomic();
+	if (atomic_dec_and_test(&b->to_write)) {
+		smp_mb__before_atomic();
+		clear_bit(B_WRITING, &b->state);
+		smp_mb__after_atomic();
 
-	wake_up_bit(&b->state, B_WRITING);
+		wake_up_bit(&b->state, B_WRITING);
+	}
 }
 
 /*
@@ -762,8 +814,7 @@ static void __write_dirty_buffer(struct dm_buffer *b,
 	clear_bit(B_DIRTY, &b->state);
 	wait_on_bit_lock_io(&b->state, B_WRITING, TASK_UNINTERRUPTIBLE);
 
-	b->write_start = b->dirty_start;
-	b->write_end = b->dirty_end;
+	bitmap_copy(b->write_bitmap, b->dirty_bitmap, b->c->bitmap_bits);
 
 	if (!write_list)
 		submit_io(b, REQ_OP_WRITE, write_endio);
@@ -1035,7 +1086,7 @@ static struct dm_buffer *__bufio_new(struct dm_bufio_client *c, sector_t block,
 	atomic_set(&b->external_count, 0);
 	b->read_error = 0;
 	b->write_error = 0;
-	b->dirty_max = 0;
+	bitmap_zero(b->alloc_bitmap, c->bitmap_bits);
 	__link_buffer(b, block, LIST_CLEAN);
 
 	if (nf == NF_FRESH) {
@@ -1100,11 +1151,12 @@ static void read_endio(struct dm_buffer *b, blk_status_t status)
 static void cleanup_partial_buffer(struct dm_bufio_client *c, struct dm_buffer *b)
 {
 	struct dm_buffer *shadow;
+	unsigned rs, re;
+	unsigned start, end;
 
 	dm_bufio_lock(c);
 
 	BUG_ON(test_bit(B_READING, &b->state));
-	BUG_ON(test_bit(B_DIRTY, &b->state) && !b->dirty_max);
 
 	/*
 	 * Already read to a shadow buffer in the background.
@@ -1115,7 +1167,7 @@ static void cleanup_partial_buffer(struct dm_bufio_client *c, struct dm_buffer *
 	atomic_set(&shadow->external_count, 0);
 	shadow->read_error = 0;
 	shadow->write_error = 0;
-	shadow->dirty_max = 0;
+	bitmap_zero(shadow->alloc_bitmap, c->bitmap_bits);
 	shadow->state = 1 << B_READING;
 
 	dm_bufio_unlock(c);
@@ -1146,12 +1198,10 @@ static void cleanup_partial_buffer(struct dm_bufio_client *c, struct dm_buffer *
 	 * Complete the partial buffer by copying the read data to the
 	 * unwritten parts of the buffer.
 	 */
-	if (b->dirty_max) {
-		memcpy(b->data, shadow->data, b->dirty_min);
-		memcpy(b->data + b->dirty_max, shadow->data + b->dirty_max,
-		       c->block_size - b->dirty_max);
-	} else {
-		memcpy(b->data, shadow->data, c->block_size);
+	bitmap_for_each_clear_region (b->alloc_bitmap, rs, re, 0, c->bitmap_bits) {
+		start = rs << c->log2_write_align; // rs * write_align
+		end = re << c->log2_write_align;
+		memcpy(b->data + start, shadow->data + start, end - start);
 	}
 
 out:
@@ -1315,29 +1365,18 @@ int dm_bufio_copyin(struct dm_bufio_client *c, void *src, sector_t block,
 	dm_bufio_lock(c);
 
 	/*
-	 * First check if the part to write is properly aligned and doesn't
-	 * create unwritten holes is the buffer. If the checks pass, skip
-	 * reading the buffer.
+	 * First check if the part to write is properly aligned, because the
+	 * read can be skipped then.
 	 */
-
 	nf = NF_FRESH;
 	start_copy = start;
 	end_copy = end;
 	align_write(c, &start_copy, &end_copy);
-	if (start != start_copy || end != end_copy) {
+	if (unlikely(end_copy > c->block_size))
+		end_copy = c->block_size;
+	if (start != start_copy || end != end_copy)
 		nf = NF_READ;
-		goto new_read;
-	}
 
-	b = __find(c, block);
-	if (b && test_bit(B_PARTIAL, &b->state) && b->dirty_max != 0) {
-		if (end < b->dirty_min || start > b->dirty_max) {
-			nf = NF_READ;
-			goto new_read;
-		}
-	}
-
-new_read:
 	dst = new_read_droplock(c, block, nf, &b);
 	if (IS_ERR(dst))
 		return PTR_ERR(dst);
@@ -1398,28 +1437,18 @@ void dm_bufio_mark_partial_buffer_dirty(struct dm_buffer *b,
 
 	BUG_ON(test_bit(B_READING, &b->state));
 
+	align_write(c, &start, &end);
+	start >>= c->log2_write_align; // start /= write_align
+	end >>= c->log2_write_align;
+
 	if (!test_and_set_bit(B_DIRTY, &b->state)) {
-		b->dirty_start = start;
-		b->dirty_end = end;
+		bitmap_zero(b->dirty_bitmap, c->bitmap_bits);
 		__relink_lru(b, LIST_DIRTY);
-	} else {
-		if (start < b->dirty_start)
-			b->dirty_start = start;
-		if (end > b->dirty_end)
-			b->dirty_end = end;
 	}
+	bitmap_set(b->dirty_bitmap, start, end - start);
+	bitmap_set(b->alloc_bitmap, start, end - start);
 
-	if (b->dirty_max == 0) {
-		b->dirty_min = start;
-		b->dirty_max = end;
-	} else {
-		if (start < b->dirty_min)
-			b->dirty_min = start;
-		if (end > b->dirty_max)
-			b->dirty_max = end;
-	}
-
-	if (b->dirty_min == 0 && b->dirty_max == c->block_size)
+	if (bitmap_full(b->alloc_bitmap, c->bitmap_bits))
 		clear_bit(B_PARTIAL, &b->state);
 
 	dm_bufio_unlock(c);
@@ -1618,8 +1647,7 @@ retry:
 		wait_on_bit_io(&b->state, B_WRITING,
 			       TASK_UNINTERRUPTIBLE);
 		set_bit(B_DIRTY, &b->state);
-		b->dirty_start = 0;
-		b->dirty_end = c->block_size;
+		bitmap_fill(b->dirty_bitmap, c->bitmap_bits);
 		__unlink_buffer(b);
 		__link_buffer(b, new_block, LIST_DIRTY);
 	} else {
@@ -1707,7 +1735,7 @@ EXPORT_SYMBOL_GPL(dm_bufio_set_minimum_buffers);
 
 unsigned dm_bufio_get_alignment(struct dm_bufio_client *c)
 {
-	return c->write_align;
+	return 1 << c->log2_write_align;
 }
 EXPORT_SYMBOL_GPL(dm_bufio_get_alignment);
 
@@ -1941,7 +1969,15 @@ struct dm_bufio_client *dm_bufio_client_create(struct block_device *bdev, unsign
 		write_align = DM_BUFIO_DEFAULT_WRITE_ALIGN;
 	if (block_size < write_align && !(block_size & (block_size - 1)))
 		write_align = block_size;
-	c->write_align = write_align;
+	c->log2_write_align = __ffs(write_align);
+
+	{
+		unsigned start, end;
+		start = 0;
+		end = block_size;
+		align_write(c, &start, &end);
+		c->bitmap_bits = end >> c->log2_write_align; // end / write_align
+	}
 
 	/*
 	 * One additional buffer per reserved buffer is needed to clean up
