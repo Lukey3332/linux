@@ -101,7 +101,14 @@ static int __ebs_rw_bvec(struct ebs_c *ec, int rw, struct bio_vec *bv, struct bv
 			} else {
 				flush_dcache_page(bv->bv_page);
 				memcpy(ba, pa, cur_len);
-				dm_bufio_mark_partial_buffer_dirty(b, buf_off, buf_off + cur_len);
+				/*
+				 * Mark the whole buffer as dirty to force dm-bufio
+				 * to write the whole block.
+				 * With dm_bufio_mark_partial_buffer_dirty it would
+				 * write in 4k blocks, which is wrong if larger
+				 * than 4k block size is requested.
+				 */
+				dm_bufio_mark_buffer_dirty(b);
 			}
 
 			dm_bufio_release(b);
