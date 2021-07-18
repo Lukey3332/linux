@@ -1525,7 +1525,7 @@ static void dm_integrity_flush_buffers(struct dm_integrity_c *ic, bool flush_dat
 		BUG_ON(r);
 	}
 
-	r = dm_bufio_write_dirty_buffers(ic->bufio);
+	r = dm_bufio_write_dirty_buffers(ic->bufio, true);
 	if (unlikely(r))
 		dm_integrity_io_error(ic, "writing tags", r);
 

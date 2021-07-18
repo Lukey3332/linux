@@ -109,9 +109,10 @@ void dm_bufio_write_dirty_buffers_async(struct dm_bufio_client *c);
 
 /*
  * Write all dirty buffers. Guarantees that all dirty buffers created prior
- * to this call are on disk when this call exits.
+ * to this call are submitted to the disk when this call exits. If flush is
+ * set, it also issues a flush afterwards.
  */
-int dm_bufio_write_dirty_buffers(struct dm_bufio_client *c);
+int dm_bufio_write_dirty_buffers(struct dm_bufio_client *c, bool flush);
 
 /*
  * Send an empty write barrier to the device to flush hardware disk cache.

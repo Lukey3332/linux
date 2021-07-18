@@ -222,7 +222,7 @@ static void __ebs_process_bios(struct work_struct *ws)
 	 * We write dirty buffers after processing I/O on them
 	 * but before we endio thus addressing REQ_FUA/REQ_SYNC.
 	 */
-	r = write ? dm_bufio_write_dirty_buffers(ec->bufio) : 0;
+	r = write ? dm_bufio_write_dirty_buffers(ec->bufio, true) : 0;
 
 	while ((bio = bio_list_pop(&bios))) {
 		/* Any other request is endioed. */
