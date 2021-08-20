@@ -176,6 +176,7 @@ static void __ebs_process_bios(struct work_struct *ws)
 {
 	int r;
 	bool write = false;
+	bool flush = false;
 	sector_t block1, block2;
 	struct ebs_c *ec = container_of(ws, struct ebs_c, ws);
 	struct bio *bio;
@@ -208,6 +209,8 @@ static void __ebs_process_bios(struct work_struct *ws)
 			r = __ebs_rw_bio(ec, READ, bio);
 		else if (bio_op(bio) == REQ_OP_WRITE) {
 			write = true;
+			if (bio->bi_opf & REQ_FUA)
+				flush = true;
 			r = __ebs_rw_bio(ec, WRITE, bio);
 		} else if (bio_op(bio) == REQ_OP_DISCARD) {
 			__ebs_forget_bio(ec, bio);
@@ -222,7 +225,7 @@ static void __ebs_process_bios(struct work_struct *ws)
 	 * We write dirty buffers after processing I/O on them
 	 * but before we endio thus addressing REQ_FUA/REQ_SYNC.
 	 */
-	r = write ? dm_bufio_write_dirty_buffers(ec->bufio, true) : 0;
+	r = write ? dm_bufio_write_dirty_buffers(ec->bufio, flush) : 0;
 
 	while ((bio = bio_list_pop(&bios))) {
 		/* Any other request is endioed. */
