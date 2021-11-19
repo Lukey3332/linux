@@ -2087,52 +2087,56 @@ static void prefetch_io(struct kiocb *iocb, struct iov_iter *i)
 	vfs_fadvise(iocb->ki_filp, pos, size, POSIX_FADV_WILLNEED);
 }
 
-static noinline int mybtrfs_copy_from_user(loff_t pos, size_t write_bytes,
-					 struct page **prepared_pages)
+static noinline int myprepare_pages(struct inode *inode, struct page **pages,
+				  size_t num_pages, loff_t pos,
+				  size_t write_bytes)
 {
-	size_t copied = 0;
-	size_t total_copied = 0;
-	int pg = 0;
-	int offset = offset_in_page(pos);
+	int i;
+	unsigned long index = pos >> PAGE_SHIFT;
+	gfp_t mask = btrfs_alloc_write_mask(inode->i_mapping);
+	int err = 0;
+	int faili;
 
-	while (write_bytes > 0) {
-		size_t count = min_t(size_t,
-				     PAGE_SIZE - offset, write_bytes);
-		struct page *page = prepared_pages[pg];
-		/*
-		 * Copy data from userspace to the current page
-		 */
-		copied = count;
+	for (i = 0; i < num_pages; i++) {
+again:
+		pages[i] = find_or_create_page(inode->i_mapping, index + i,
+					       mask | __GFP_WRITE);
+		if (!pages[i]) {
+			faili = i - 1;
+			err = -ENOMEM;
+			goto fail;
+		}
 
-		/* Flush processor's dcache for this page */
-		flush_dcache_page(page);
+		err = set_page_extent_mapped(pages[i]);
+		if (err < 0) {
+			// Might return -ENOMEM
+			faili = i;
+			goto fail;
+		}
 
-		/*
-		 * if we get a partial write, we can end up with
-		 * partially up to date pages.  These add
-		 * a lot of complexity, so make sure they don't
-		 * happen by forcing this copy to be retried.
-		 *
-		 * The rest of the btrfs_file_write code will fall
-		 * back to page at a time copies after we return 0.
-		 */
-		if (unlikely(copied < count)) {
-			if (!PageUptodate(page)) {
-				copied = 0;
+		err = prepare_uptodate_page(inode, pages[i], pos,
+					    true);
+		if (err) {
+			put_page(pages[i]);
+			if (err == -EAGAIN) {
+				err = 0;
+				goto again;
 			}
-			if (!copied)
-				break;
+			faili = i - 1;
+			goto fail;
 		}
-
-		write_bytes -= copied;
-		total_copied += copied;
-		offset += copied;
-		if (offset == PAGE_SIZE) {
-			pg++;
-			offset = 0;
-		}
+		wait_on_page_writeback(pages[i]);
 	}
-	return total_copied;
+
+	return 0;
+fail:
+	while (faili >= 0) {
+		unlock_page(pages[faili]);
+		put_page(pages[faili]);
+		faili--;
+	}
+	return err;
+
 }
 
 static noinline ssize_t rewrite_io(struct kiocb *iocb, struct iov_iter *in)
@@ -2150,8 +2154,6 @@ static noinline ssize_t rewrite_io(struct kiocb *iocb, struct iov_iter *in)
 	size_t num_written = 0;
 	int nrptrs;
 	ssize_t ret;
-	bool only_release_metadata = false;
-	bool force_page_uptodate = false;
 	loff_t old_isize = i_size_read(inode);
 	unsigned int ilock_flags = 0;
 
@@ -2162,13 +2164,13 @@ static noinline ssize_t rewrite_io(struct kiocb *iocb, struct iov_iter *in)
 	if (ret < 0)
 		return ret;
 
-	ret = generic_write_checks(iocb, in);
-	if (ret <= 0)
-		goto out;
+	//ret = generic_write_checks(iocb, in);
+	//if (ret <= 0)
+		//goto out;
 
-	ret = btrfs_write_check(iocb, in, ret);
-	if (ret < 0)
-		goto out;
+	//ret = btrfs_write_check(iocb, in, ret);
+	//if (ret < 0)
+		//goto out;
 
 	pos = iocb->ki_pos;
 	size = iov_iter_count(in);
@@ -2199,24 +2201,14 @@ static noinline ssize_t rewrite_io(struct kiocb *iocb, struct iov_iter *in)
 		size_t num_sectors;
 		int extents_locked;
 
-		only_release_metadata = false;
 		sector_offset = pos & (fs_info->sectorsize - 1);
 
 		extent_changeset_release(data_reserved);
-		ret = btrfs_check_data_free_space(BTRFS_I(inode),
+		ret = btrfs_delalloc_reserve_space(BTRFS_I(inode),
 						  &data_reserved, pos,
 						  write_bytes);
 		if (ret < 0) {
-			/*
-			 * If we don't have to COW at the offset, reserve
-			 * metadata only. write_bytes may get smaller than
-			 * requested here.
-			 */
-			if (btrfs_check_nocow_lock(BTRFS_I(inode), pos,
-						   &write_bytes) > 0)
-				only_release_metadata = true;
-			else
-				break;
+			break;
 		}
 
 		num_pages = DIV_ROUND_UP(write_bytes + offset, PAGE_SIZE);
@@ -2227,12 +2219,9 @@ static noinline ssize_t rewrite_io(struct kiocb *iocb, struct iov_iter *in)
 		ret = btrfs_delalloc_reserve_metadata(BTRFS_I(inode),
 				reserve_bytes);
 		if (ret) {
-			if (!only_release_metadata)
-				btrfs_free_reserved_data_space(BTRFS_I(inode),
-						data_reserved, pos,
-						write_bytes);
-			else
-				btrfs_check_nocow_unlock(BTRFS_I(inode));
+			btrfs_free_reserved_data_space(BTRFS_I(inode),
+					data_reserved, pos,
+					write_bytes);
 			break;
 		}
 
@@ -2243,9 +2232,8 @@ again:
 		 * pages we want, so we don't really need to worry about the
 		 * contents of pages from loop to loop
 		 */
-		ret = prepare_pages(inode, pages, num_pages,
-				    pos, write_bytes,
-				    force_page_uptodate);
+		ret = myprepare_pages(inode, pages, num_pages,
+				    pos, write_bytes);
 		if (ret) {
 			btrfs_delalloc_release_extents(BTRFS_I(inode),
 						       reserve_bytes);
@@ -2265,46 +2253,26 @@ again:
 			break;
 		}
 
-		copied = mybtrfs_copy_from_user(pos, write_bytes, pages);
+		copied = write_bytes;
 
 		num_sectors = BTRFS_BYTES_TO_BLKS(fs_info, reserve_bytes);
 		dirty_sectors = round_up(copied + sector_offset,
 					fs_info->sectorsize);
 		dirty_sectors = BTRFS_BYTES_TO_BLKS(fs_info, dirty_sectors);
 
-		/*
-		 * if we have trouble faulting in the pages, fall
-		 * back to one page at a time
-		 */
-		if (copied < write_bytes)
-			nrptrs = 1;
-
-		if (copied == 0) {
-			force_page_uptodate = true;
-			dirty_sectors = 0;
-			dirty_pages = 0;
-		} else {
-			force_page_uptodate = false;
-			dirty_pages = DIV_ROUND_UP(copied + offset,
-						   PAGE_SIZE);
-		}
+		dirty_pages = DIV_ROUND_UP(copied + offset, PAGE_SIZE);
 
 		if (num_sectors > dirty_sectors) {
+			u64 __pos;
+
 			/* release everything except the sectors we dirtied */
 			release_bytes -= dirty_sectors << fs_info->sectorsize_bits;
-			if (only_release_metadata) {
-				btrfs_delalloc_release_metadata(BTRFS_I(inode),
-							release_bytes, true);
-			} else {
-				u64 __pos;
 
-				__pos = round_down(pos,
-						   fs_info->sectorsize) +
-					(dirty_pages << PAGE_SHIFT);
-				btrfs_delalloc_release_space(BTRFS_I(inode),
-						data_reserved, __pos,
-						release_bytes, true);
-			}
+			__pos = round_down(pos, fs_info->sectorsize) +
+					   (dirty_pages << PAGE_SHIFT);
+			btrfs_delalloc_release_space(BTRFS_I(inode),
+					data_reserved, __pos,
+					release_bytes, true);
 		}
 
 		release_bytes = round_up(copied + sector_offset,
@@ -2312,7 +2280,7 @@ again:
 
 		ret = btrfs_dirty_pages(BTRFS_I(inode), pages,
 					dirty_pages, pos, copied,
-					&cached_state, only_release_metadata);
+					&cached_state, false);
 
 		/*
 		 * If we have not locked the extent range, because the range's
@@ -2334,8 +2302,6 @@ again:
 		}
 
 		release_bytes = 0;
-		if (only_release_metadata)
-			btrfs_check_nocow_unlock(BTRFS_I(inode));
 
 		btrfs_drop_pages(fs_info, pages, num_pages, pos, copied);
 
@@ -2351,16 +2317,10 @@ again:
 	kfree(pages);
 
 	if (release_bytes) {
-		if (only_release_metadata) {
-			btrfs_check_nocow_unlock(BTRFS_I(inode));
-			btrfs_delalloc_release_metadata(BTRFS_I(inode),
-					release_bytes, true);
-		} else {
-			btrfs_delalloc_release_space(BTRFS_I(inode),
-					data_reserved,
-					round_down(pos, fs_info->sectorsize),
-					release_bytes, true);
-		}
+		btrfs_delalloc_release_space(BTRFS_I(inode),
+				data_reserved,
+				round_down(pos, fs_info->sectorsize),
+				release_bytes, true);
 	}
 
 	extent_changeset_free(data_reserved);
