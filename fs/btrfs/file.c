@@ -30,6 +30,7 @@
 #include "delalloc-space.h"
 #include "reflink.h"
 #include "subpage.h"
+#include <linux/fadvise.h>
 
 static struct kmem_cache *btrfs_inode_defrag_cachep;
 /*
@@ -3763,6 +3764,15 @@ again:
 	return ret < 0 ? ret : read;
 }
 
+static void prefetch_recordsize_io(struct kiocb *iocb, struct iov_iter *i)
+{
+	loff_t pos = iocb->ki_pos;
+	size_t size = iov_iter_count(i);
+
+	align_io(&pos, &size, i_size_read(file_inode(iocb->ki_filp)));
+	vfs_fadvise(iocb->ki_filp, pos, size, POSIX_FADV_WILLNEED);
+}
+
 static ssize_t btrfs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	ssize_t ret = 0;
@@ -3774,6 +3784,7 @@ static ssize_t btrfs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 			return ret;
 	}
 
+	prefetch_recordsize_io(iocb, to);
 	return filemap_read(iocb, to, ret);
 }
 
