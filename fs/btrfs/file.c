@@ -1353,11 +1353,27 @@ static int prepare_uptodate_page(struct inode *inode,
 }
 
 /*
+ * Align *offset and *size to recordsize
+ */
+static void align_io(loff_t *offset, size_t *size, loff_t filesize)
+{
+	int alignement = 64*1024;
+	loff_t end = *offset + *size;
+	*offset &= -alignement;
+	if (end < filesize) {
+		end += alignement - 1;
+		end &= -alignement;
+		end = min(end, filesize);
+	}
+	*size = end - *offset;
+}
+
+/*
  * this just gets pages into the page cache and locks them down.
  */
 static noinline int prepare_pages(struct inode *inode, struct page **pages,
 				  size_t num_pages, loff_t pos,
-				  size_t write_bytes)
+				  size_t write_bytes, bool force_uptodate)
 {
 	int i;
 	unsigned long index = pos >> PAGE_SHIFT;
@@ -1381,9 +1397,9 @@ again:
 			goto fail;
 		}
 
-		if (i == 0)
+		if (i == 0 || force_uptodate)
 			err = prepare_uptodate_page(inode, pages[i], pos,
-						    false);
+						    force_uptodate);
 		if (!err && i == num_pages - 1)
 			err = prepare_uptodate_page(inode, pages[i],
 						    pos + write_bytes, false);
@@ -1641,7 +1657,8 @@ static noinline ssize_t btrfs_buffered_write(struct kiocb *iocb,
 					       struct iov_iter *i)
 {
 	struct file *file = iocb->ki_filp;
-	loff_t pos;
+	loff_t pos, real_pos;
+	size_t count, real_count;
 	struct inode *inode = file_inode(file);
 	struct btrfs_fs_info *fs_info = btrfs_sb(inode->i_sb);
 	struct page **pages = NULL;
@@ -1653,6 +1670,7 @@ static noinline ssize_t btrfs_buffered_write(struct kiocb *iocb,
 	int nrptrs;
 	ssize_t ret;
 	bool only_release_metadata = false;
+	bool fault_in_failed = false;
 	loff_t old_isize = i_size_read(inode);
 	unsigned int ilock_flags = 0;
 
@@ -1671,7 +1689,11 @@ static noinline ssize_t btrfs_buffered_write(struct kiocb *iocb,
 	if (ret < 0)
 		goto out;
 
-	pos = iocb->ki_pos;
+	real_pos = iocb->ki_pos;
+	pos = real_pos;
+	real_count = iov_iter_count(i);
+	count = real_count;
+	align_io(&pos, &count, old_isize);
 	nrptrs = min(DIV_ROUND_UP(iov_iter_count(i), PAGE_SIZE),
 			PAGE_SIZE / (sizeof(struct page *)));
 	nrptrs = min(nrptrs, current->nr_dirtied_pause - current->nr_dirtied);
@@ -1682,24 +1704,43 @@ static noinline ssize_t btrfs_buffered_write(struct kiocb *iocb,
 		goto out;
 	}
 
-	while (iov_iter_count(i) > 0) {
+	while (count > 0) {
 		struct extent_state *cached_state = NULL;
 		size_t offset = offset_in_page(pos);
 		size_t sector_offset;
-		size_t write_bytes = min(iov_iter_count(i),
+		size_t write_bytes = min(count,
 					 nrptrs * (size_t)PAGE_SIZE -
 					 offset);
 		size_t num_pages;
 		size_t reserve_bytes;
 		int extents_locked;
+		bool padding = true;
+
+		if (!(pos + write_bytes <= real_pos ||
+		      pos >= real_pos + real_count) &&
+		    !fault_in_failed) {
+			if (pos < real_pos) {
+				write_bytes = min_t(size_t, write_bytes, real_pos - pos);
+			} else {
+				write_bytes = min_t(size_t, write_bytes,
+						    real_pos + real_count - pos);
+				padding = false;
+			}
+		}
 
 		/*
 		 * Fault pages before locking them in prepare_pages
 		 * to avoid recursive lock
 		 */
-		if (unlikely(fault_in_iov_iter_readable(i, write_bytes))) {
-			ret = -EFAULT;
-			break;
+		if (!padding) {
+			if (unlikely(fault_in_iov_iter_readable(i, write_bytes))) {
+				/*
+				 * Fault in failed, but still continue to pad the
+				 * write up to recordsize.
+				 */
+				fault_in_failed = true;
+				continue;
+			}
 		}
 
 		only_release_metadata = false;
@@ -1748,7 +1789,7 @@ again:
 		 * contents of pages from loop to loop
 		 */
 		ret = prepare_pages(inode, pages, num_pages,
-				    pos, write_bytes);
+				    pos, write_bytes, padding);
 		if (ret) {
 			btrfs_delalloc_release_extents(BTRFS_I(inode),
 						       reserve_bytes);
@@ -1768,7 +1809,8 @@ again:
 			break;
 		}
 
-		btrfs_copy_from_user(pos, write_bytes, pages, i);
+		if (!padding)
+			btrfs_copy_from_user(pos, write_bytes, pages, i);
 
 		ret = btrfs_dirty_pages(BTRFS_I(inode), pages,
 					num_pages, pos, write_bytes,
@@ -1804,7 +1846,9 @@ again:
 		balance_dirty_pages_ratelimited(inode->i_mapping);
 
 		pos += write_bytes;
-		num_written += write_bytes;
+		count -= write_bytes;
+		if (!padding)
+			num_written += write_bytes;
 	}
 
 	kfree(pages);
@@ -1829,6 +1873,8 @@ again:
 	}
 out:
 	btrfs_inode_unlock(inode, ilock_flags);
+	if (!ret && fault_in_failed)
+		ret = -EFAULT;
 	return num_written ? num_written : ret;
 }
 
