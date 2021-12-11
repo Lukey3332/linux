@@ -386,17 +386,27 @@ int btrfs_run_defrag_inodes(struct btrfs_fs_info *fs_info)
  * and be replaced with calls into generic code.
  */
 static noinline int btrfs_copy_from_user(loff_t pos, size_t write_bytes,
+					 loff_t real_pos, size_t real_count,
 					 struct page **prepared_pages,
 					 struct iov_iter *i)
 {
 	size_t copied = 0;
 	size_t total_copied = 0;
-	int pg = 0;
-	int offset = offset_in_page(pos);
+	bool overlap = !(pos + write_bytes <= real_pos ||
+			 pos >= real_pos + real_count);
+	loff_t real_start = max(pos, real_pos);
+	loff_t real_end = min(pos + write_bytes, real_pos + real_count);
+	pgoff_t range_start = pos >> PAGE_SHIFT;
+	pgoff_t usercopy_start = real_start >> PAGE_SHIFT;
+	int pg = usercopy_start - range_start;
+	size_t len = real_end - real_start;
+	int offset = offset_in_page(real_start);
 
-	while (write_bytes > 0) {
-		size_t count = min_t(size_t,
-				     PAGE_SIZE - offset, write_bytes);
+	if (!overlap)
+		return 0;
+
+	while (len > 0) {
+		size_t count = min_t(size_t, PAGE_SIZE - offset, len);
 		struct page *page = prepared_pages[pg];
 		/*
 		 * Copy data from userspace to the current page
@@ -408,7 +418,7 @@ static noinline int btrfs_copy_from_user(loff_t pos, size_t write_bytes,
 
 		BUG_ON(copied != count);
 
-		write_bytes -= copied;
+		len -= copied;
 		total_copied += copied;
 		offset += copied;
 		if (offset == PAGE_SIZE) {
@@ -1315,45 +1325,6 @@ out:
 }
 
 /*
- * on error we return an unlocked page and the error value
- * on success we return a locked page and 0
- */
-static int prepare_uptodate_page(struct inode *inode,
-				 struct page *page, u64 pos,
-				 bool force_uptodate)
-{
-	int ret = 0;
-
-	if (((pos & (PAGE_SIZE - 1)) || force_uptodate) &&
-	    !PageUptodate(page)) {
-		ret = btrfs_readpage(NULL, page);
-		if (ret)
-			return ret;
-		lock_page(page);
-		if (!PageUptodate(page)) {
-			unlock_page(page);
-			return -EIO;
-		}
-
-		/*
-		 * Since btrfs_readpage() will unlock the page before it
-		 * returns, there is a window where btrfs_releasepage() can be
-		 * called to release the page.  Here we check both inode
-		 * mapping and PagePrivate() to make sure the page was not
-		 * released.
-		 *
-		 * The private flag check is essential for subpage as we need
-		 * to store extra bitmap using page->private.
-		 */
-		if (page->mapping != inode->i_mapping || !PagePrivate(page)) {
-			unlock_page(page);
-			return -EAGAIN;
-		}
-	}
-	return 0;
-}
-
-/*
  * Align *offset and *size to recordsize
  */
 static void align_io(loff_t *offset, size_t *size, loff_t filesize)
@@ -1369,51 +1340,45 @@ static void align_io(loff_t *offset, size_t *size, loff_t filesize)
 	*size = end - *offset;
 }
 
-/*
- * this just gets pages into the page cache and locks them down.
- */
-static noinline int prepare_pages(struct inode *inode, struct page **pages,
-				  size_t num_pages, loff_t pos,
-				  size_t write_bytes, bool force_uptodate)
+static int readahead_pages(struct file_ra_state *ra, struct inode *inode,
+			   struct page **pages, pgoff_t index, pgoff_t last_index)
 {
-	int i;
-	unsigned long index = pos >> PAGE_SHIFT;
-	gfp_t mask = btrfs_alloc_write_mask(inode->i_mapping);
-	int err = 0;
+	int i = 0;
 	int faili;
+	int ret;
+	gfp_t mask = btrfs_alloc_write_mask(inode->i_mapping);
 
-	for (i = 0; i < num_pages; i++) {
-again:
-		pages[i] = find_or_create_page(inode->i_mapping, index + i,
-					       mask | __GFP_WRITE);
+	while (index <= last_index) {
+		pages[i] = find_lock_page(inode->i_mapping, index);
 		if (!pages[i]) {
-			faili = i - 1;
-			err = -ENOMEM;
-			goto fail;
-		}
+			page_cache_sync_readahead(inode->i_mapping, ra,
+				NULL, index, last_index + 1 - index);
 
-		err = set_page_extent_mapped(pages[i]);
-		if (err < 0) {
-			faili = i;
-			goto fail;
-		}
-
-		if (i == 0 || force_uptodate)
-			err = prepare_uptodate_page(inode, pages[i], pos,
-						    force_uptodate);
-		if (!err && i == num_pages - 1)
-			err = prepare_uptodate_page(inode, pages[i],
-						    pos + write_bytes, false);
-		if (err) {
-			put_page(pages[i]);
-			if (err == -EAGAIN) {
-				err = 0;
-				goto again;
+			pages[i] = find_or_create_page(inode->i_mapping, index,
+						       mask | __GFP_WRITE);
+			if (!pages[i]) {
+				ret = -ENOMEM;
+				goto fail;
 			}
-			faili = i - 1;
-			goto fail;
 		}
-		wait_on_page_writeback(pages[i]);
+
+		if (PageReadahead(pages[i])) {
+			page_cache_async_readahead(inode->i_mapping, ra,
+				NULL, pages[i], index, last_index + 1 - index);
+		}
+
+		if (!PageUptodate(pages[i])) {
+			btrfs_readpage(NULL, pages[i]);
+			lock_page(pages[i]);
+			if (!PageUptodate(pages[i])) {
+				faili = i;
+				ret = -EIO;
+				goto fail;
+			}
+		}
+
+		index++;
+		i++;
 	}
 
 	return 0;
@@ -1423,7 +1388,120 @@ fail:
 		put_page(pages[faili]);
 		faili--;
 	}
-	return err;
+	return ret;
+}
+
+static int create_pages(struct inode *inode, struct page **pages,
+			pgoff_t index, pgoff_t last_index)
+{
+	int i = 0;
+	int faili;
+	int ret;
+	gfp_t mask = btrfs_alloc_write_mask(inode->i_mapping);
+
+	while (index <= last_index) {
+		pages[i] = find_or_create_page(inode->i_mapping, index,
+					       mask | __GFP_WRITE);
+		if (!pages[i]) {
+			ret = -ENOMEM;
+			faili = i - 1;
+			goto fail;
+		}
+
+		ret = set_page_extent_mapped(pages[i]);
+		if (ret < 0) {
+			faili = i;
+			goto fail;
+		}
+
+		wait_on_page_writeback(pages[i]);
+
+		index++;
+		i++;
+	}
+	return 0;
+
+fail:
+	while (faili >= 0) {
+		unlock_page(pages[faili]);
+		put_page(pages[faili]);
+		faili--;
+	}
+	return ret;
+}
+
+/*
+ * this just gets pages into the page cache and locks them down.
+ */
+static noinline int prepare_pages(struct inode *inode, struct page **pages,
+				  size_t num_pages, loff_t pos,
+				  size_t write_bytes, loff_t real_pos,
+				  size_t real_count, bool force_uptodate)
+{
+	int i = 0;
+	struct file_ra_state ra = { 0 };
+	int ret = 0;
+	unsigned long index = pos >> PAGE_SHIFT;
+	bool overlap = !(pos + write_bytes <= real_pos ||
+			 pos >= real_pos + real_count);
+	loff_t real_start = max(pos, real_pos);
+	loff_t real_end = min(pos + write_bytes, real_pos + real_count);
+	pgoff_t range_start = pos >> PAGE_SHIFT;
+	pgoff_t range_end = (pos + write_bytes - 1) >> PAGE_SHIFT;
+	pgoff_t usercopy_start = DIV_ROUND_UP(real_start, PAGE_SIZE); // round up
+	pgoff_t usercopy_end = (real_end - 1) >> PAGE_SHIFT; // round down
+
+	file_ra_state_init(&ra, inode->i_mapping);
+
+	if (force_uptodate || !overlap)
+		goto whole_range;
+
+	if (real_end & (PAGE_SIZE - 1)) {
+		if (usercopy_end)
+			usercopy_end -= 1;
+		else
+			goto whole_range;
+	}
+
+	if (usercopy_start > usercopy_end)
+		goto whole_range;
+
+	if (range_start < usercopy_start) {
+		ret = readahead_pages(&ra, inode, pages + i, range_start, usercopy_start - 1);
+		if (ret)
+			return ret;
+
+		i += usercopy_start - range_start;
+	}
+
+	ret = create_pages(inode, pages + i, usercopy_start, usercopy_end);
+	if (ret)
+		goto fail;
+
+	i += usercopy_end + 1 - usercopy_start;
+
+	if (range_end > usercopy_end) {
+		ret = readahead_pages(&ra, inode, pages + i, usercopy_end + 1, range_end);
+		if (ret)
+			goto fail;
+
+		i += range_end - usercopy_end;
+	}
+
+	ASSERT(i == num_pages);
+
+	return 0;
+
+whole_range:
+	return readahead_pages(&ra, inode, pages, index, index + num_pages - 1);
+
+fail:
+	while (i >= 0) {
+		unlock_page(pages[i]);
+		put_page(pages[i]);
+		i--;
+	}
+	return ret;
 
 }
 
@@ -1714,33 +1792,23 @@ static noinline ssize_t btrfs_buffered_write(struct kiocb *iocb,
 					 offset);
 		size_t num_pages;
 		size_t reserve_bytes;
+		size_t copied = 0;
 		int extents_locked;
-		bool padding = true;
-
-		if (!(pos + write_bytes <= real_pos ||
-		      pos >= real_pos + real_count) &&
-		    !fault_in_failed) {
-			if (pos < real_pos) {
-				write_bytes = min_t(size_t, write_bytes, real_pos - pos);
-			} else {
-				write_bytes = min_t(size_t, write_bytes,
-						    real_pos + real_count - pos);
-				padding = false;
-			}
-		}
+		bool overlap = !(pos + write_bytes <= real_pos ||
+				 pos >= real_pos + real_count);
 
 		/*
 		 * Fault pages before locking them in prepare_pages
 		 * to avoid recursive lock
 		 */
-		if (!padding) {
-			if (unlikely(fault_in_iov_iter_readable(i, write_bytes))) {
+		if (!fault_in_failed && overlap) {
+			if (unlikely(fault_in_iov_iter_readable(i, min(pos + write_bytes, real_pos + real_count) - max(pos, real_pos)))) {
+				BUG_ON(1);
 				/*
 				 * Fault in failed, but still continue to pad the
 				 * write up to recordsize.
 				 */
 				fault_in_failed = true;
-				continue;
 			}
 		}
 
@@ -1790,7 +1858,8 @@ again:
 		 * contents of pages from loop to loop
 		 */
 		ret = prepare_pages(inode, pages, num_pages,
-				    pos, write_bytes, padding);
+				    pos, write_bytes, real_pos, real_count,
+				    fault_in_failed);
 		if (ret) {
 			btrfs_delalloc_release_extents(BTRFS_I(inode),
 						       reserve_bytes);
@@ -1810,8 +1879,10 @@ again:
 			break;
 		}
 
-		if (!padding)
-			btrfs_copy_from_user(pos, write_bytes, pages, i);
+		if (!fault_in_failed)
+			copied = btrfs_copy_from_user(pos, write_bytes,
+						      real_pos, real_count,
+						      pages, i);
 
 		ret = btrfs_dirty_pages(BTRFS_I(inode), pages,
 					num_pages, pos, write_bytes,
@@ -1848,8 +1919,7 @@ again:
 
 		pos += write_bytes;
 		count -= write_bytes;
-		if (!padding)
-			num_written += write_bytes;
+		num_written += copied;
 	}
 
 	kfree(pages);
