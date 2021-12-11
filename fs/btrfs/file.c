@@ -1466,6 +1466,11 @@ static noinline int prepare_pages(struct inode *inode, struct page **pages,
 	if (usercopy_start > usercopy_end)
 		goto whole_range;
 
+	if (range_start < usercopy_start &&
+	    range_end > usercopy_end &&
+	    real_end - real_start < 64*1024)
+		goto whole_range;
+
 	if (range_start < usercopy_start) {
 		ret = readahead_pages(&ra, inode, pages + i, range_start, usercopy_start - 1);
 		if (ret)
@@ -1776,7 +1781,7 @@ static noinline ssize_t btrfs_buffered_write(struct kiocb *iocb,
 	nrptrs = min(DIV_ROUND_UP(iov_iter_count(i), PAGE_SIZE),
 			PAGE_SIZE / (sizeof(struct page *)));
 	nrptrs = min(nrptrs, current->nr_dirtied_pause - current->nr_dirtied);
-	nrptrs = max(nrptrs, 8);
+	nrptrs = max(nrptrs, 16); // 64*1024/PAGE_SIZE
 	pages = kmalloc_array(nrptrs, sizeof(struct page *), GFP_KERNEL);
 	if (!pages) {
 		ret = -ENOMEM;
