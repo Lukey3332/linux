@@ -952,6 +952,10 @@ struct btrfs_fs_info {
 
 	struct btrfs_delayed_root *delayed_root;
 
+	/* recordsize readahead limit */
+	wait_queue_head_t recordsize_ra_wait;
+	int recordsize_ra_queued;
+
 	/* readahead tree */
 	spinlock_t reada_lock;
 	struct radix_tree_root reada_tree;

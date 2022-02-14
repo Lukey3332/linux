@@ -1737,6 +1737,250 @@ static int btrfs_write_check(struct kiocb *iocb, struct iov_iter *from,
 	return 0;
 }
 
+struct async_dirty_cb {
+	loff_t real_pos;
+	size_t real_count;
+	struct inode* inode;
+	struct btrfs_work work;
+};
+
+static void async_dirty_work(struct btrfs_work *work)
+{
+	struct async_dirty_cb* cb = container_of(work, struct async_dirty_cb, work);
+	struct inode *inode = cb->inode;
+	struct btrfs_fs_info *fs_info = btrfs_sb(inode->i_sb);
+	loff_t isize = i_size_read(inode);
+	loff_t pos, real_pos;
+	size_t count, real_count;
+	ssize_t ret;
+	int nrptrs = 16;
+	struct page** pages;
+
+
+	struct extent_changeset *data_reserved = NULL;
+	u64 release_bytes = 0;
+	u64 lockstart;
+	u64 lockend;
+	bool only_release_metadata = false;
+
+	real_pos = cb->real_pos;
+	pos = real_pos;
+	real_count = cb->real_count;
+	count = real_count;
+	align_io(&pos, &count, isize);
+
+	pages = kmalloc_array(nrptrs, sizeof(struct page *), GFP_KERNEL);
+	if (!pages) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	// first prefetch all pages
+	while (count > 0) {
+		size_t write_bytes = min(count, nrptrs * (size_t)PAGE_SIZE);
+		int num_pages;
+		bool overlap = !(pos + write_bytes <= real_pos ||
+				 pos >= real_pos + real_count);
+		if (overlap) {
+			BUG_ON(pos > real_pos);
+			if (pos == real_pos) {
+				pos += real_count;
+				count -= real_count;
+				write_bytes = min(count, nrptrs * (size_t)PAGE_SIZE);
+			} else {
+				write_bytes = min_t(size_t, write_bytes, real_pos - pos);
+			}
+		}
+		overlap = !(pos + write_bytes <= real_pos ||
+			    pos >= real_pos + real_count);
+		BUG_ON(overlap);
+		num_pages = DIV_ROUND_UP(write_bytes, PAGE_SIZE);
+		BUG_ON(num_pages > nrptrs);
+
+		ret = prepare_pages(inode, pages, num_pages,
+				    pos, write_bytes, real_pos, real_count,
+				    true);
+
+		num_pages--;
+		while (num_pages >= 0) {
+			unlock_page(pages[num_pages]);
+			put_page(pages[num_pages]);
+			num_pages--;
+		}
+
+		if (ret) goto out_free_pages;
+
+		cond_resched();
+
+		pos += write_bytes;
+		count -= write_bytes;
+	}
+
+	// Now actually dirty the pages
+	ret = btrfs_inode_lock(inode, 0);
+	if (ret < 0)
+		goto out_free_pages;
+
+	isize = i_size_read(inode);
+	pos = real_pos;
+	count = real_count;
+	align_io(&pos, &count, isize);
+
+	while (count > 0) {
+		struct extent_state *cached_state = NULL;
+		size_t sector_offset;
+		size_t write_bytes = min(count, nrptrs * (size_t)PAGE_SIZE);
+		size_t num_pages;
+		size_t reserve_bytes;
+		int extents_locked;
+
+		bool overlap = !(pos + write_bytes <= real_pos ||
+				 pos >= real_pos + real_count);
+		if (overlap) {
+			BUG_ON(pos > real_pos);
+			if (pos == real_pos) {
+				pos += real_count;
+				count -= real_count;
+				continue;
+			} else {
+				write_bytes = min_t(size_t, write_bytes, real_pos - pos);
+			}
+		}
+		overlap = !(pos + write_bytes <= real_pos ||
+			    pos >= real_pos + real_count);
+		BUG_ON(overlap);
+
+		only_release_metadata = false;
+		sector_offset = pos & (fs_info->sectorsize - 1);
+
+		extent_changeset_release(data_reserved);
+		ret = btrfs_check_data_free_space(BTRFS_I(inode),
+						  &data_reserved, pos,
+						  write_bytes);
+		if (ret < 0) {
+			/*
+			 * If we don't have to COW at the offset, reserve
+			 * metadata only. write_bytes may get smaller than
+			 * requested here.
+			 */
+			if (btrfs_check_nocow_lock(BTRFS_I(inode), pos,
+						   &write_bytes) > 0)
+				only_release_metadata = true;
+			else
+				break;
+		}
+
+		num_pages = DIV_ROUND_UP(write_bytes, PAGE_SIZE);
+		WARN_ON(num_pages > nrptrs);
+		reserve_bytes = round_up(write_bytes + sector_offset,
+					 fs_info->sectorsize);
+		WARN_ON(reserve_bytes == 0);
+
+		ret = btrfs_delalloc_reserve_metadata(BTRFS_I(inode),
+				reserve_bytes);
+		if (ret) {
+			if (!only_release_metadata)
+				btrfs_free_reserved_data_space(BTRFS_I(inode),
+						data_reserved, pos,
+						write_bytes);
+			else
+				btrfs_check_nocow_unlock(BTRFS_I(inode));
+			break;
+		}
+
+		release_bytes = reserve_bytes;
+again:
+		/*
+		 * This is going to setup the pages array with the number of
+		 * pages we want, so we don't really need to worry about the
+		 * contents of pages from loop to loop
+		 */
+		ret = prepare_pages(inode, pages, num_pages,
+				    pos, write_bytes, real_pos, real_count,
+				    true);
+		if (ret) {
+			btrfs_delalloc_release_extents(BTRFS_I(inode),
+						       reserve_bytes);
+			break;
+		}
+
+		extents_locked = lock_and_cleanup_extent_if_need(
+				BTRFS_I(inode), pages,
+				num_pages, pos, write_bytes, &lockstart,
+				&lockend, &cached_state);
+		if (extents_locked < 0) {
+			if (extents_locked == -EAGAIN)
+				goto again;
+			btrfs_delalloc_release_extents(BTRFS_I(inode),
+						       reserve_bytes);
+			ret = extents_locked;
+			break;
+		}
+
+		ret = btrfs_dirty_pages(BTRFS_I(inode), pages,
+					num_pages, pos, write_bytes,
+					&cached_state, only_release_metadata);
+
+		/*
+		 * If we have not locked the extent range, because the range's
+		 * start offset is >= i_size, we might still have a non-NULL
+		 * cached extent state, acquired while marking the extent range
+		 * as delalloc through btrfs_dirty_pages(). Therefore free any
+		 * possible cached extent state to avoid a memory leak.
+		 */
+		if (extents_locked)
+			unlock_extent_cached(&BTRFS_I(inode)->io_tree,
+					     lockstart, lockend, &cached_state);
+		else
+			free_extent_state(cached_state);
+
+		btrfs_delalloc_release_extents(BTRFS_I(inode), reserve_bytes);
+		if (ret) {
+			btrfs_drop_pages(fs_info, pages, num_pages, pos, write_bytes);
+			break;
+		}
+
+		release_bytes = 0;
+		if (only_release_metadata)
+			btrfs_check_nocow_unlock(BTRFS_I(inode));
+
+		btrfs_drop_pages(fs_info, pages, num_pages, pos, write_bytes);
+
+		cond_resched();
+
+		balance_dirty_pages_ratelimited(inode->i_mapping);
+
+		pos += write_bytes;
+		count -= write_bytes;
+	}
+
+	if (release_bytes) {
+		if (only_release_metadata) {
+			btrfs_check_nocow_unlock(BTRFS_I(inode));
+			btrfs_delalloc_release_metadata(BTRFS_I(inode),
+					release_bytes, true);
+		} else {
+			btrfs_delalloc_release_space(BTRFS_I(inode),
+					data_reserved,
+					round_down(pos, fs_info->sectorsize),
+					release_bytes, true);
+		}
+	}
+
+	extent_changeset_free(data_reserved);
+	btrfs_inode_unlock(inode, 0);
+
+out_free_pages:
+	kfree(pages);
+out:
+	spin_lock(&fs_info->recordsize_ra_wait.lock);
+	fs_info->recordsize_ra_queued--;
+	wake_up_locked(&fs_info->recordsize_ra_wait);
+	spin_unlock(&fs_info->recordsize_ra_wait.lock);
+	kfree(cb);
+	BUG_ON(ret);
+}
+
 static noinline ssize_t btrfs_buffered_write(struct kiocb *iocb,
 					       struct iov_iter *i)
 {
@@ -1758,6 +2002,39 @@ static noinline ssize_t btrfs_buffered_write(struct kiocb *iocb,
 	loff_t old_isize = i_size_read(inode);
 	unsigned int ilock_flags = 0;
 
+	real_pos = iocb->ki_pos;
+	pos = real_pos;
+	real_count = iov_iter_count(i);
+	count = real_count;
+	if (real_pos & (PAGE_SIZE - 1) || (real_pos + real_count) & (PAGE_SIZE - 1)) {
+		align_io(&pos, &count, old_isize);
+	} else {
+		struct async_dirty_cb* cb;
+		cb = kmalloc(sizeof(*cb), GFP_KERNEL);
+		if (!cb) {
+			return -ENOMEM;
+		}
+		cb->real_pos = real_pos;
+		cb->real_count = real_count;
+		cb->inode = inode;
+
+		spin_lock(&fs_info->recordsize_ra_wait.lock);
+		// just continue with sync readahead instead of wait?
+		ret = wait_event_interruptible_locked(fs_info->recordsize_ra_wait, fs_info->recordsize_ra_queued < 32);
+		if (ret) {
+			spin_unlock(&fs_info->recordsize_ra_wait.lock);
+			kfree(cb);
+			return ret;
+		}
+		fs_info->recordsize_ra_queued++;
+		spin_unlock(&fs_info->recordsize_ra_wait.lock);
+
+		btrfs_init_work(&cb->work, async_dirty_work, NULL, NULL);
+		btrfs_queue_work(fs_info->rmw_workers, &cb->work);
+
+		old_isize = i_size_read(inode);
+	}
+
 	if (iocb->ki_flags & IOCB_NOWAIT)
 		ilock_flags |= BTRFS_ILOCK_TRY;
 
@@ -1773,11 +2050,6 @@ static noinline ssize_t btrfs_buffered_write(struct kiocb *iocb,
 	if (ret < 0)
 		goto out;
 
-	real_pos = iocb->ki_pos;
-	pos = real_pos;
-	real_count = iov_iter_count(i);
-	count = real_count;
-	align_io(&pos, &count, old_isize);
 	nrptrs = min(DIV_ROUND_UP(iov_iter_count(i), PAGE_SIZE),
 			PAGE_SIZE / (sizeof(struct page *)));
 	nrptrs = min(nrptrs, current->nr_dirtied_pause - current->nr_dirtied);
